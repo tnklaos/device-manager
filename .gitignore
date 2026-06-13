@@ -1,7 +1,7 @@
 # ---- Secrets / local config (NEVER commit) ----
 settings.json          # ngrok token, client-id, api-key, per-device passwords + last_ref
 devices.txt            # serials + passwords for the batch runner
-
+dist
 # ---- Python ----
 venv/
 .venv/
