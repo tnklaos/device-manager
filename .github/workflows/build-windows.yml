@@ -1,9 +1,10 @@
 name: Build Windows EXE
 
-# Build on a manual trigger and on version tags (e.g. v1.0.0).
+# Build on a manual trigger, on every push to main, and on version tags.
 on:
   workflow_dispatch: {}
   push:
+    branches: ["main"]
     tags: ["v*"]
 
 permissions:
