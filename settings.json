@@ -1,0 +1,40 @@
+{
+  "ngrok_token": "3Eu7eTzqhEl29NUYrMehhz9ZeVs_73gSxCDPCbcM58R4DJUHE",
+  "devices": {
+    "192.168.100.7:39641": {
+      "username": "93244003",
+      "password": ""
+    },
+    "3463511727001CN": {
+      "last_ref": "202606102270299",
+      "username": "",
+      "password": ""
+    },
+    "192.168.100.221:39427": {
+      "username": "",
+      "password": "",
+      "last_ref": ""
+    },
+    "192.168.100.221:42379": {
+      "username": "93244003",
+      "password": "",
+      "last_ref": "202606102270299"
+    },
+    "192.168.100.7:41131": {
+      "username": "",
+      "password": "",
+      "last_ref": "202606132553009"
+    },
+    "192.168.100.7:39567": {
+      "username": "",
+      "password": "",
+      "last_ref": "202606141000068"
+    }
+  },
+  "csl": {
+    "api_url": "https://paymentgateway.108pay.co",
+    "client_id": "894019c1-1289-47d5-a74d-105127505752",
+    "api_key": "05790f1d-fd58-4652-9c08-cddf9438c1e4",
+    "webhook": "https://treble-joyride-ahead.ngrok-free.dev"
+  }
+}

@@ -1,0 +1,48 @@
+# ---- Secrets / local config (NEVER commit) ----
+settings.json          # ngrok token, client-id, api-key, per-device passwords + last_ref
+devices.txt            # serials + passwords for the batch runner
+
+# ---- Python ----
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# ---- PyInstaller build output ----
+build/
+dist/
+*.manifest
+# keep DeviceManager.spec (source); ignore any other generated specs
+/*.spec
+!DeviceManager.spec
+
+# ---- Bundled external binaries (large, platform-specific — re-added at build) ----
+bin/mac/
+bin/win/*
+!bin/win/README.txt
+
+# ---- Generated icons (run make_icon.py to regenerate) ----
+build_assets/icon.png
+build_assets/icon.ico
+build_assets/icon.icns
+build_assets/icon.iconset/
+
+# ---- Runtime artifacts ----
+logs/
+*.png                  # device screenshots (qr_*.png, phone_*.png, message_*.png, ...)
+qr_*.txt               # decoded QR payloads
+transactions.json
+messages.json
+messages.csv
+screen.xml
+window_dump.xml
+*.output
+
+# ---- OS / editor ----
+.DS_Store
+*.swp
+.idea/
+.vscode/

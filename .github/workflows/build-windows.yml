@@ -1,0 +1,65 @@
+name: Build Windows EXE
+
+# Build on a manual trigger and on version tags (e.g. v1.0.0).
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write          # needed to attach the exe to a Release on tags
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Fetch adb + ngrok into bin\win
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bin\win | Out-Null
+
+          # Android platform-tools (adb.exe + its DLLs)
+          Invoke-WebRequest "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile pt.zip
+          Expand-Archive pt.zip -DestinationPath pt -Force
+          Copy-Item pt\platform-tools\adb.exe            bin\win\
+          Copy-Item pt\platform-tools\AdbWinApi.dll       bin\win\
+          Copy-Item pt\platform-tools\AdbWinUsbApi.dll    bin\win\
+
+          # ngrok v3 (windows amd64)
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath ngrok -Force
+          Copy-Item ngrok\ngrok.exe bin\win\
+
+          Get-ChildItem bin\win
+
+      - name: Generate app icon
+        run: python make_icon.py
+
+      - name: Build single-file EXE
+        run: python -m PyInstaller --noconfirm --clean DeviceManager.spec
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeviceManager-windows
+          path: dist/DeviceManager.exe
+          if-no-files-found: error
+
+      - name: Attach EXE to Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DeviceManager.exe
