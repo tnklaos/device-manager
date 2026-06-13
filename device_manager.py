@@ -47,6 +47,9 @@ for _p in ("/opt/homebrew/bin", "/usr/local/bin",
 SETTINGS_FILE = os.path.join(HERE, "settings.json")
 API_PORT = 8000
 CSL_API_URL = "https://paymentgateway.108pay.co"
+# On Windows, hide the console window that pops up for each child process (adb,
+# scrcpy, …). 0 on macOS/Linux, so behaviour there is unchanged.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 MONITOR_INTERVAL = 60   # seconds between message polls
 NOTIF_INTERVAL = 20     # seconds between notification polls (they get dismissed)
 MONITOR_KINDS = {"TRI"}  # only report these message kinds (TRI = received transfer)
@@ -166,7 +169,8 @@ class Btn(tk.Canvas):
 
 
 def adb(*args):
-    return subprocess.run(["adb", *args], capture_output=True, text=True).stdout
+    return subprocess.run(["adb", *args], capture_output=True, text=True,
+                          creationflags=NO_WINDOW).stdout
 
 
 def device_online(serial):
@@ -492,7 +496,8 @@ class DeviceRow(tk.Frame):
     def mirror(self):
         subprocess.Popen(["scrcpy", "--serial", self.serial,
                           "--window-title", self.serial],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=NO_WINDOW)
         self.app.notify(f"Mirroring {self.serial}", color=SLATE_H)
 
     def disconnect(self):

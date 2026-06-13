@@ -21,10 +21,15 @@ PKG = "com.bcel.bcelone"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+# hide the per-child console window on Windows (0 on macOS/Linux)
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 # ----------------- notification reading (pure adb, no agent) -----------------
 def _adb(serial, *args):
     return subprocess.run(["adb", "-s", serial, *args],
-                          capture_output=True, text=True).stdout
+                          capture_output=True, text=True,
+                          creationflags=NO_WINDOW).stdout
 
 
 def read_notifications(serial, pkg=PKG):

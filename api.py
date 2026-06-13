@@ -35,7 +35,8 @@ def device_lock(serial):
 
 
 def list_devices():
-    out = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True).stdout
+    out = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
     devices = []
     for line in out.splitlines()[1:]:
         line = line.strip()
