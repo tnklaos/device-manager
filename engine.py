@@ -129,12 +129,20 @@ class Engine:
         self.emit("log", {"msg": msg})
 
     # ---------- settings ----------
+    def api_url(self):
+        return (self.settings.get("csl", {}).get("api_url") or "").strip() or GATEWAY_API_URL
+
+    def save_api_url(self, url):
+        self.settings.setdefault("csl", {})["api_url"] = (url or "").strip()
+        save_settings(self.settings)
+
     def get_settings(self):
         gw = self.settings.get("csl", {})
         return {
             "client_id": gw.get("client_id", ""),
             "has_secret": bool(gw.get("api_key")),
             "ngrok_token_set": bool(self.settings.get("ngrok_token")),
+            "api_url": self.api_url(),
         }
 
     def save_gateway(self, client_id, secret_key):
