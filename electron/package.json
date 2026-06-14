@@ -2,6 +2,7 @@
   "name": "device-manager",
   "version": "1.0.0",
   "description": "Device Manager",
+  "author": "Device Manager",
   "main": "main.js",
   "scripts": {
     "start": "electron .",

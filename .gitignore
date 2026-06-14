@@ -15,9 +15,10 @@ __pycache__/
 build/
 dist/
 *.manifest
-# keep DeviceManager.spec (source); ignore any other generated specs
+# keep the source specs; ignore any other generated specs
 /*.spec
 !DeviceManager.spec
+!Backend.spec
 
 # ---- Bundled external binaries (large, platform-specific — re-added at build) ----
 bin/mac/
