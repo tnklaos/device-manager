@@ -46,3 +46,7 @@ window_dump.xml
 *.swp
 .idea/
 .vscode/
+
+# Electron
+electron/node_modules/
+electron/release/

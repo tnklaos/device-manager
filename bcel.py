@@ -176,26 +176,28 @@ def do_login(d, pwd, username="", log=print):
     if not pwd:
         raise RuntimeError("login required but no password provided")
     log("login screen detected — signing in")
-    d.set_input_ime(True)
+    # d.set_input_ime(True)
     time.sleep(0.5)
     # Username: only entered if the login screen actually shows an account field.
     # Normally the app remembers the account, so this is skipped.
-    if username:
-        for rid in ("username", "account", "phone", "user", "userId"):
-            el = d(resourceId=rid)
-            if el.exists:
-                el.click()
-                time.sleep(0.4)
-                clear_and_type(d, username)
-                log("entered username")
-                break
+    # if username:
+    #     for rid in ("username", "account", "phone", "user", "userId"):
+    #         el = d(resourceId=rid)
+    #         if el.exists:
+    #             el.click()
+    #             time.sleep(0.4)
+    #             clear_and_type(d, username)
+    #             log("entered username")
+    #             break
     # Password: entered every time we hit the login screen.
-    d(resourceId="password").click()
-    time.sleep(0.6)
-    clear_and_type(d, pwd)
-    time.sleep(0.5)
-    d.set_input_ime(False)
-    d(resourceId="login").click()
+    d.xpath('//*[@hint="ລະຫັດຜ່ານ"]').click()
+    d.send_keys("", clear=True)  # ch is undefined
+    
+    for word in pwd:
+        d.send_keys(word, clear=False)  # ch is undefined
+        time.sleep(0.1)
+
+    d.xpath('//*[@text="ເຂົ້າສູ່ລະບົບ"]').click()
     deadline = time.time() + 45
     while time.time() < deadline:
         act = d.app_current().get("activity", "")
@@ -255,6 +257,7 @@ def create_qr(serial, amount, description, password="", username="", submit=True
     If go_home_after is False, skips the final return-to-dashboard step (the
     API runs that in the background so the caller isn't blocked on it)."""
     d = connect(serial, password, username, log=log)
+    poll_messages(serial, "", password, username, 6)
     go_home(d)            # normalize to the dashboard (cheap if already there)
 
     tap(d, "My QR")
@@ -390,45 +393,46 @@ def open_messages_tab(d):
 
 
 def refresh_messages(d):
-    """Tap the message refresh icon without relying on one fixed offset."""
-    display_width = d.info.get("displayWidth", 1080)
-    display_height = d.info.get("displayHeight", 2408)
+    d.xpath('//*[@resource-id="titlecontext"]').click()
+    # """Tap the message refresh icon without relying on one fixed offset."""
+    # display_width = d.info.get("displayWidth", 1080)
+    # display_height = d.info.get("displayHeight", 2408)
 
-    title_candidates = []
-    for el in d.xpath('//*').all():
-        if (el.text or "").strip() == "ຂໍ້ຄວາມ":
-            bounds = _parse_bounds(el.attrib.get("bounds", ""))
-            if bounds:
-                title_candidates.append(bounds)
-    title_bounds = next(
-        (bounds for bounds in sorted(title_candidates, key=lambda item: item[1])
-         if bounds[1] < display_height * 0.4),
-        title_candidates[0] if title_candidates else None)
+    # title_candidates = []
+    # for el in d.xpath('//*').all():
+    #     if (el.text or "").strip() == "ຂໍ້ຄວາມ":
+    #         bounds = _parse_bounds(el.attrib.get("bounds", ""))
+    #         if bounds:
+    #             title_candidates.append(bounds)
+    # title_bounds = next(
+    #     (bounds for bounds in sorted(title_candidates, key=lambda item: item[1])
+    #      if bounds[1] < display_height * 0.4),
+    #     title_candidates[0] if title_candidates else None)
 
-    title_center_y = ((title_bounds[1] + title_bounds[3]) // 2
-                      if title_bounds else int(display_height * 0.125))
-    y_tolerance = (max(80, (title_bounds[3] - title_bounds[1]) * 1.3)
-                   if title_bounds else display_height * 0.06)
-    candidates = []
-    for el in d.xpath('//*[@clickable="true"]').all():
-        bounds = _parse_bounds(el.attrib.get("bounds", ""))
-        if not bounds:
-            continue
-        left, top, right, bottom = bounds
-        center_x, center_y = (left + right) // 2, (top + bottom) // 2
-        if center_x < display_width * 0.75:
-            continue
-        if abs(center_y - title_center_y) > y_tolerance:
-            continue
-        if bottom - top > display_height * 0.12:
-            continue
-        candidates.append((center_x, center_y))
+    # title_center_y = ((title_bounds[1] + title_bounds[3]) // 2
+    #                   if title_bounds else int(display_height * 0.125))
+    # y_tolerance = (max(80, (title_bounds[3] - title_bounds[1]) * 1.3)
+    #                if title_bounds else display_height * 0.06)
+    # candidates = []
+    # for el in d.xpath('//*[@clickable="true"]').all():
+    #     bounds = _parse_bounds(el.attrib.get("bounds", ""))
+    #     if not bounds:
+    #         continue
+    #     left, top, right, bottom = bounds
+    #     center_x, center_y = (left + right) // 2, (top + bottom) // 2
+    #     if center_x < display_width * 0.75:
+    #         continue
+    #     if abs(center_y - title_center_y) > y_tolerance:
+    #         continue
+    #     if bottom - top > display_height * 0.12:
+    #         continue
+    #     candidates.append((center_x, center_y))
 
-    if candidates:
-        center_x, center_y = sorted(candidates, reverse=True)[0]
-        d.click(center_x, center_y)
-    else:
-        d.click(0.93, title_center_y / display_height)
+    # if candidates:
+    #     center_x, center_y = sorted(candidates, reverse=True)[0]
+    #     d.click(center_x, center_y)
+    # else:
+    #     d.click(0.93, title_center_y / display_height)
     time.sleep(2.0)
     # Scroll back to the very top so every cycle reads from the NEWEST message.
     # Without this, a list left scrolled-down from the previous cycle makes the

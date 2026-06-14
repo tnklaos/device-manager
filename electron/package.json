@@ -1,0 +1,26 @@
+{
+  "name": "device-manager",
+  "version": "1.0.0",
+  "description": "Device Manager",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.devicemanager.app",
+    "productName": "Device Manager",
+    "directories": { "output": "release" },
+    "files": ["main.js", "renderer/**/*"],
+    "extraResources": [
+      { "from": "../dist/backend", "to": "backend" }
+    ],
+    "mac": { "target": "dmg", "category": "public.app-category.utilities", "identity": null },
+    "win": { "target": "nsis", "icon": "../build_assets/icon.ico" },
+    "linux": { "target": "AppImage" }
+  },
+  "devDependencies": {
+    "electron": "^32.0.0",
+    "electron-builder": "^24.13.3"
+  }
+}

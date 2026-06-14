@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src http://127.0.0.1:8000" />
+  <title>Device Manager</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">◆</span> Device Manager</div>
+      <nav>
+        <a class="nav active" data-view="devices">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><line x1="10.5" y1="18.5" x2="13.5" y2="18.5"/></svg>
+          Devices
+        </a>
+        <a class="nav" data-view="transactions">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="13" y2="17"/></svg>
+          Transactions
+        </a>
+        <a class="nav" data-view="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M5.1 5.1l2 2M16.9 16.9l2 2M2.5 12h3M18.5 12h3M5.1 18.9l2-2M16.9 7.1l2-2"/></svg>
+          Settings
+        </a>
+        <a class="nav" data-view="guide">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5z"/><line x1="9" y1="7.5" x2="15" y2="7.5"/></svg>
+          Guide
+        </a>
+      </nav>
+      <div class="side-foot">
+        <span id="backend-dot" class="dot off"></span>
+        <span id="backend-label">connecting…</span>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <header class="topbar">
+        <h1 id="view-title">Devices</h1>
+        <div class="top-actions">
+          <span id="counter" class="chip">0 monitoring</span>
+          <button id="pair-btn" class="btn primary sm" style="margin-left:10px">📷 Pair device</button>
+        </div>
+      </header>
+
+      <section id="view-devices" class="view">
+        <div id="devices-grid" class="grid"></div>
+        <div id="devices-empty" class="empty hidden">
+          No devices found. Connect a phone over USB or pair via Wireless debugging.
+        </div>
+      </section>
+
+      <section id="view-transactions" class="view hidden">
+        <div class="tx-toolbar">
+          <input id="tx-search" type="text" placeholder="🔍  Search by account, name, ref, amount…" />
+          <button id="tx-clear" class="btn ghost sm">Clear log</button>
+        </div>
+        <table class="tx-table">
+          <thead><tr>
+            <th>Time</th><th>Device</th><th>Kind</th><th>Type</th>
+            <th>From (source account)</th><th>To</th>
+            <th>Amount</th><th>Details</th><th>Reference</th>
+          </tr></thead>
+          <tbody id="tx-body"></tbody>
+        </table>
+        <div id="tx-empty" class="empty">No synced transactions yet.</div>
+      </section>
+
+      <section id="view-settings" class="view hidden">
+        <div class="card form-card">
+          <h2>Payment Gateway</h2>
+          <p class="muted">Credentials used to sign transactions sent to the gateway.</p>
+          <label>Client ID</label>
+          <input id="set-client" type="text" placeholder="client id" />
+          <label>Secret Key</label>
+          <input id="set-secret" type="password" placeholder="leave blank to keep current" />
+          <div class="row-actions">
+            <button id="set-save" class="btn primary">Save</button>
+            <span id="set-status" class="muted"></span>
+          </div>
+        </div>
+
+        <div class="card form-card" style="margin-top:16px">
+          <h2>Sync <span id="sync-dot" class="dot off" style="display:inline-block;vertical-align:middle"></span></h2>
+          <p class="muted">Expose the local API over a public HTTPS URL (optional).</p>
+          <label>Sync Token</label>
+          <input id="sync-token" type="password" placeholder="ngrok auth token" />
+          <div class="row-actions">
+            <button id="sync-start" class="btn green">Start Sync</button>
+            <button id="sync-stop" class="btn red">Stop</button>
+          </div>
+          <label>Public URL</label>
+          <input id="sync-url" type="text" readonly placeholder="(not running)" />
+        </div>
+      </section>
+
+      <section id="view-guide" class="view hidden">
+        <div id="guide-content" class="card guide"></div>
+      </section>
+
+      <!-- Activity log dock -->
+      <footer class="logdock">
+        <div class="logdock-head" id="logdock-toggle">
+          <span>Activity</span><span class="muted" id="log-hint">▾</span>
+        </div>
+        <pre id="log" class="log"></pre>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Credentials modal -->
+  <div id="modal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h3 id="modal-title">Device credentials</h3>
+      <div class="muted mono" id="modal-serial"></div>
+      <label>Username</label>
+      <input id="m-user" type="text" placeholder="(usually blank)" />
+      <label>Password</label>
+      <input id="m-pass" type="password" />
+      <label>Last reference (watermark)</label>
+      <input id="m-ref" type="text" placeholder="blank = set baseline on next poll" />
+      <div class="row-actions">
+        <button id="m-save" class="btn primary">Save</button>
+        <button id="m-cancel" class="btn ghost">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- QR pairing modal -->
+  <div id="qr-modal" class="modal-backdrop hidden">
+    <div class="modal" style="text-align:center; width:340px">
+      <h3>Pair device with QR</h3>
+      <p class="muted">Phone → Developer options → Wireless debugging → Pair with QR code → scan</p>
+      <img id="qr-img" alt="QR" style="width:240px;height:240px;background:#fff;border-radius:10px;padding:8px" />
+      <div id="qr-status" class="muted" style="margin:14px 0">Waiting for scan…</div>
+      <button id="qr-close" class="btn ghost">Close</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

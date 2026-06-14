@@ -46,10 +46,24 @@ for _p in ("/opt/homebrew/bin", "/usr/local/bin",
         os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + _p
 SETTINGS_FILE = os.path.join(HERE, "settings.json")
 API_PORT = 8000
-CSL_API_URL = "https://paymentgateway.108pay.co"
+GATEWAY_API_URL = "https://paymentgateway.108pay.co"
 # On Windows, hide the console window that pops up for each child process (adb,
 # scrcpy, …). 0 on macOS/Linux, so behaviour there is unchanged.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# Patch Popen ONCE so EVERY child process starts without a console window —
+# including ngrok, which pyngrok launches internally (that's the window that
+# still popped up from the Settings page). run()/check_output() use Popen too,
+# so they inherit it. No-op on macOS/Linux (NO_WINDOW == 0).
+if NO_WINDOW:
+    _orig_popen = subprocess.Popen
+
+    class _NoWindowPopen(_orig_popen):
+        def __init__(self, *a, **k):
+            k["creationflags"] = k.get("creationflags", 0) | NO_WINDOW
+            super().__init__(*a, **k)
+
+    subprocess.Popen = _NoWindowPopen
 MONITOR_INTERVAL = 60   # seconds between message polls
 NOTIF_INTERVAL = 20     # seconds between notification polls (they get dismissed)
 MONITOR_KINDS = {"TRI"}  # only report these message kinds (TRI = received transfer)
@@ -246,9 +260,6 @@ class DeviceRow(tk.Frame):
         btns.pack(side="right")
         self.play_btn = Btn(btns, "Play", GREEN, GREEN_H, self.play, padx=9, font_size=10)
         self.play_btn.pack(side="left", padx=2)
-        self.listen_btn = Btn(btns, "Listen", "#0ea5e9", "#0284c7", self.listen,
-                              padx=9, font_size=10)
-        self.listen_btn.pack(side="left", padx=2)
         self.stop_btn = Btn(btns, "Stop", RED, RED_H, self.stop, padx=9, font_size=10)
         self.stop_btn.pack(side="left", padx=2)
         self.stop_btn.set_enabled(False)
@@ -385,7 +396,6 @@ class DeviceRow(tk.Frame):
         self.listen_active = True
         self._seen_notif = set()
         self.play_btn.set_enabled(False)
-        self.listen_btn.set_enabled(False)
         self.stop_btn.set_enabled(True)
         self._draw_dot("#0ea5e9")
         self.set_status("listening", "#bae6fd", "#075985")
@@ -432,7 +442,6 @@ class DeviceRow(tk.Frame):
 
     def _listen_stopped(self):
         self.play_btn.set_enabled(True)
-        self.listen_btn.set_enabled(True)
         self.stop_btn.set_enabled(False)
         self._draw_dot(GREEN)
         self.set_status("idle", SUBTEXT)
@@ -442,7 +451,6 @@ class DeviceRow(tk.Frame):
     def _listen_disconnected(self):
         self.listen_active = False
         self.play_btn.set_enabled(True)
-        self.listen_btn.set_enabled(True)
         self.stop_btn.set_enabled(False)
         self._draw_dot(RED)
         self.set_status("disconnected", "#fecaca", "#7f1d1d")
@@ -451,14 +459,14 @@ class DeviceRow(tk.Frame):
         self.app.update_counter()
 
     def _send_webhook(self, new_msgs):
-        """POST new transactions to the saved CSL API /bcel/transactions path.
+        """POST new transactions to the saved Payment Gateway API /bcel/transactions path.
         No new transactions (e.g. the top message's ref == the saved last_ref)
         means nothing to sync — skip the API call entirely."""
         if not new_msgs:
             return
         transactions = [{**m, "serial": self.serial} for m in new_msgs]
         cfg = self.app.settings.get("csl", {})
-        api_url = CSL_API_URL
+        api_url = GATEWAY_API_URL
         client_id = (cfg.get("client_id") or "").strip()
         api_key = (cfg.get("api_key") or "").strip()
         if not all((api_url, client_id, api_key)):
@@ -471,7 +479,10 @@ class DeviceRow(tk.Frame):
                 api_url, client_id, api_key, transactions, timeout=10)
             self._post(lambda: self.app.log(
                 f"→ {self.serial}: synced {len(transactions)} transaction(s): {msg}"))
-            if not ok:
+            if ok:
+                # show them in the Logs tab
+                self._post(lambda tx=transactions: self.app.log_transaction(tx))
+            else:
                 self._post(lambda: self.app.notify(
                     f"{self.serial}: transaction send failed", color=RED))
         except Exception as e:
@@ -599,7 +610,8 @@ class App:
         sidebar.pack_propagate(False)
         tk.Label(sidebar, text="◆  Manager", bg=SIDEBAR, fg=TEXT,
                  font=(FONT, 15, "bold")).pack(anchor="w", pady=(22, 18), padx=18)
-        for icon, name in [("▣", "Devices"), ("⚙", "Settings"), ("≡", "Logs")]:
+        for icon, name in [("▣", "Devices"), ("⚙", "Settings"),
+                           ("📖", "Guide"), ("≡", "Logs")]:
             lbl = tk.Label(sidebar, text=f"  {icon}  {name}", bg=SIDEBAR, fg=SUBTEXT,
                            anchor="w", font=(FONT, 12), cursor="hand2")
             lbl.pack(fill="x", padx=10, pady=2, ipady=8)
@@ -626,38 +638,29 @@ class App:
 
         self.devices_view = self.build_devices_view(self.view_container)
         self.settings_view = self.build_settings_view(self.view_container)
+        self.guide_view = self.build_guide_view(self.view_container)
+        self.logs_view = self.build_logs_view(self.view_container)
         self.show_view("Devices")
         self.refresh()
         self.refresh_tunnel_status()   # reflect an already-running tunnel
+        self._auto_refresh()           # keep the device list up to date (no ↻ button)
 
     # ---- views ----
     def build_devices_view(self, parent):
         v = tk.Frame(parent, bg=BG)
 
-        # header: title + counter (left), bulk actions (right)
+        # header: title + counter (left), QR connect (right)
         head = tk.Frame(v, bg=BG)
-        head.pack(fill="x", padx=16, pady=(14, 4))
+        head.pack(fill="x", padx=16, pady=(14, 6))
         tk.Label(head, text="Devices", bg=BG, fg=TEXT,
                  font=(FONT, 17, "bold")).pack(side="left")
         self.counter = tk.Label(head, text="0 / 0", bg=MUTED_BG, fg=SUBTEXT,
                                 font=(FONT, 10, "bold"), padx=9, pady=2)
         self.counter.pack(side="left", padx=9, pady=(5, 0))
-        Btn(head, "↻", INDIGO, INDIGO_H, self.refresh, padx=10, font_size=12).pack(side="right")
-        Btn(head, "Disconnect All", PURPLE, PURPLE_H, self.disconnect_all, padx=10, font_size=10).pack(side="right", padx=6)
-        Btn(head, "Run All", GREEN, GREEN_H, self.run_all, padx=10, font_size=10).pack(side="right")
+        Btn(head, "📷 QR", GREEN, GREEN_H, self.show_qr_dialog, padx=11).pack(side="right")
 
-        # slim connect bar
-        strip = tk.Frame(v, bg=CARD)
-        strip.pack(fill="x", padx=16, pady=(2, 6))
-        inner = tk.Frame(strip, bg=CARD)
-        inner.pack(fill="x", padx=8, pady=6)
+        # kept for QR/programmatic connect; the device list auto-refreshes
         self.connect_ip = tk.StringVar(value="")
-        ent = tk.Entry(inner, textvariable=self.connect_ip, bg=BG, fg=TEXT,
-                       insertbackground=TEXT, relief="flat", width=20, font=("Menlo", 11))
-        ent.pack(side="left", ipady=5)
-        ent.bind("<Return>", lambda e: self.connect_device())
-        Btn(inner, "Connect", INDIGO, INDIGO_H, self.connect_device, padx=11).pack(side="left", padx=6)
-        Btn(inner, "📷 QR", GREEN, GREEN_H, self.show_qr_dialog, padx=11).pack(side="left")
 
         self.list_frame = tk.Frame(v, bg=BG)
         self.list_frame.pack(fill="both", expand=True, pady=(2, 0))
@@ -671,7 +674,7 @@ class App:
         # ---- device setting card ----
         csl = self.settings.get("csl", {})
         self.url_var = tk.StringVar(value="")
-        self.csl_api_url = tk.StringVar(value=CSL_API_URL)
+        self.csl_api_url = tk.StringVar(value=GATEWAY_API_URL)
         self.csl_client_id = tk.StringVar(value=csl.get("client_id", ""))
         self.csl_api_key = tk.StringVar(value=csl.get("api_key", ""))
         self.csl_webhook = tk.StringVar(value=csl.get("webhook", WEBHOOK_URL))
@@ -680,7 +683,7 @@ class App:
         card.pack(fill="x", padx=18, pady=6)
         pad = tk.Frame(card, bg=CARD)
         pad.pack(fill="x", padx=16, pady=14)
-        tk.Label(pad, text="Device Setting", bg=CARD, fg=TEXT,
+        tk.Label(pad, text="Payment Gateway", bg=CARD, fg=TEXT,
                  font=(FONT, 13, "bold")).pack(anchor="w")
 
         tk.Label(pad, text="Sync Token", bg=CARD, fg=SUBTEXT, font=(FONT, 10)).pack(anchor="w", pady=(12, 0))
@@ -715,13 +718,120 @@ class App:
         Btn(btnrow, "Save", INDIGO, INDIGO_H, self.save_csl, padx=14).pack(side="left")
         return v
 
+    def build_guide_view(self, parent):
+        v = tk.Frame(parent, bg=BG)
+        tk.Label(v, text="User Guide", bg=BG, fg=TEXT,
+                 font=(FONT, 18, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
+
+        wrap = tk.Frame(v, bg=CARD)
+        wrap.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+        scroll = tk.Scrollbar(wrap)
+        scroll.pack(side="right", fill="y")
+        txt = tk.Text(wrap, bg=CARD, fg=TEXT, insertbackground=TEXT, relief="flat",
+                      wrap="word", font=(FONT, 12), padx=16, pady=14,
+                      yscrollcommand=scroll.set, highlightthickness=0, spacing1=2,
+                      spacing3=4)
+        txt.pack(side="left", fill="both", expand=True)
+        scroll.config(command=txt.yview)
+
+        # simple heading styles
+        txt.tag_configure("h1", font=(FONT, 17, "bold"), foreground="#9bb4ff",
+                          spacing1=12, spacing3=6)
+        txt.tag_configure("h2", font=(FONT, 14, "bold"), foreground=TEXT,
+                          spacing1=10, spacing3=4)
+        txt.tag_configure("dim", foreground=SUBTEXT)
+
+        # load USER_GUIDE.md (works in dev and inside the frozen app)
+        path = os.path.join(getattr(sys, "_MEIPASS", HERE), "USER_GUIDE.md")
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            content = "User guide not found (USER_GUIDE.md)."
+
+        for line in content.splitlines():
+            if line.startswith("# "):
+                txt.insert("end", line[2:] + "\n", "h1")
+            elif line.startswith("## "):
+                txt.insert("end", line[3:] + "\n", "h2")
+            elif line.strip() in ("---", "***"):
+                txt.insert("end", "─" * 40 + "\n", "dim")
+            else:
+                # strip simple markdown emphasis/table pipes for readability
+                clean = line.replace("**", "").replace("`", "")
+                txt.insert("end", clean + "\n")
+        txt.config(state="disabled")
+        return v
+
+    def build_logs_view(self, parent):
+        v = tk.Frame(parent, bg=BG)
+        head = tk.Frame(v, bg=BG)
+        head.pack(fill="x", padx=16, pady=(14, 6))
+        tk.Label(head, text="Synced Transactions", bg=BG, fg=TEXT,
+                 font=(FONT, 17, "bold")).pack(side="left")
+        self.tx_count = tk.Label(head, text="0", bg=MUTED_BG, fg=SUBTEXT,
+                                 font=(FONT, 10, "bold"), padx=9, pady=2)
+        self.tx_count.pack(side="left", padx=9, pady=(5, 0))
+        Btn(head, "Clear", SLATE, SLATE_H, self._clear_tx_log, padx=11,
+            font_size=10).pack(side="right")
+
+        wrap = tk.Frame(v, bg=CARD)
+        wrap.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        sb = tk.Scrollbar(wrap)
+        sb.pack(side="right", fill="y")
+        self.tx_log = tk.Text(wrap, bg="#0a0e16", fg=TEXT, relief="flat", wrap="none",
+                              font=("Menlo", 10), padx=12, pady=8, state="disabled",
+                              yscrollcommand=sb.set, highlightthickness=0)
+        self.tx_log.pack(side="left", fill="both", expand=True)
+        sb.config(command=self.tx_log.yview)
+        self.tx_log.tag_configure("amt", foreground="#7ee787")
+        self.tx_log.tag_configure("dim", foreground=SUBTEXT)
+        self._tx_n = 0
+        return v
+
+    def log_transaction(self, txns):
+        """Append successfully-synced transactions to the Logs tab."""
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.tx_log.config(state="normal")
+        for t in txns:
+            amt = t.get("amount_in") or t.get("amount") or ""
+            self.tx_log.insert("end", f"{stamp}  ", "dim")
+            self.tx_log.insert("end", f"{t.get('serial','')}  ", "dim")
+            self.tx_log.insert("end", f"{t.get('type','')}  ")
+            self.tx_log.insert("end", f"{amt}  ", "amt")
+            self.tx_log.insert("end", f"ref {t.get('ref','')}\n", "dim")
+            self._tx_n += 1
+        self.tx_log.see("end")
+        self.tx_log.config(state="disabled")
+        self.tx_count.config(text=str(self._tx_n))
+
+    def _clear_tx_log(self):
+        self.tx_log.config(state="normal")
+        self.tx_log.delete("1.0", "end")
+        self.tx_log.config(state="disabled")
+        self._tx_n = 0
+        self.tx_count.config(text="0")
+
+    def _auto_refresh(self):
+        # rebuild the device list only when the connected set actually changes
+        try:
+            current = {d[0] for d in list_devices()}
+            known = {r.serial for r in self.rows}
+            if current != known:
+                self.refresh()
+        except Exception:
+            pass
+        self.root.after(4000, self._auto_refresh)
+
     def show_view(self, name):
         self.devices_view.pack_forget()
         self.settings_view.pack_forget()
-        view = {"Devices": self.devices_view, "Settings": self.settings_view}.get(name)
-        if view is None:           # "Logs" -> focus the console
+        self.guide_view.pack_forget()
+        self.logs_view.pack_forget()
+        view = {"Devices": self.devices_view, "Settings": self.settings_view,
+                "Guide": self.guide_view, "Logs": self.logs_view}.get(name)
+        if view is None:
             self.devices_view.pack(fill="both", expand=True)
-            self.console.focus_set()
             name = "Devices"
         else:
             view.pack(fill="both", expand=True)
@@ -822,7 +932,7 @@ class App:
         self.settings.setdefault("devices", {}).setdefault(serial, {})[key] = value
         save_settings(self.settings)
 
-    # ---- CSL payment gateway ----
+    # ---- payment gateway ----
     def _current_public_url(self):
         return self.public_url or detect_running_tunnel()
 
@@ -835,7 +945,7 @@ class App:
         self.notify("Sync connection ready", color=GREEN)
 
     def _sync_webhook_to_ngrok(self, url):
-        """Auto-fill the CSL webhook with the public URL if it's empty or was
+        """Auto-fill the gateway webhook with the public URL if it's empty or was
         already pointing at a (stale) ngrok URL."""
         if not hasattr(self, "csl_webhook"):
             return
@@ -849,7 +959,7 @@ class App:
             self.csl_webhook.set(webhook)
 
         cfg = {
-            "api_url": CSL_API_URL,
+            "api_url": GATEWAY_API_URL,
             "client_id": self.csl_client_id.get().strip(),
             "api_key": self.csl_api_key.get().strip(),
             "webhook": webhook,

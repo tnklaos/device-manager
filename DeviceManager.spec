@@ -26,6 +26,10 @@ if os.path.isdir(_bin_src):
     for fn in os.listdir(_bin_src):
         datas.append((os.path.join(_bin_src, fn), "bin"))
 
+# bundle the in-app user guide
+if os.path.exists("USER_GUIDE.md"):
+    datas.append(("USER_GUIDE.md", "."))
+
 a = Analysis(
     ["device_manager.py"],
     pathex=["."],
