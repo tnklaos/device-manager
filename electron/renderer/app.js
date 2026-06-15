@@ -248,6 +248,13 @@ function setBackend(up) {
   $("#backend-label").textContent = up ? "connected" : "offline";
 }
 
+async function loadVersion() {
+  try {
+    const r = await api("/api/health");
+    if (r && r.version) $("#app-version").textContent = "v" + r.version;
+  } catch (e) { /* leave placeholder */ }
+}
+
 // ---------- boot ----------
 async function boot() {
   try {
@@ -256,6 +263,7 @@ async function boot() {
   } catch (e) {
     setBackend(false);
   }
+  loadVersion();
   connectStream();
   // light polling as a fallback for device hot-plug
   setInterval(loadDevices, 5000);

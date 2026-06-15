@@ -47,7 +47,9 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 .nav.active svg { opacity: 1; }
 .nav:hover { background: #131a27; color: var(--text); }
 .nav.active { background: var(--indigo); color: #fff; }
-.side-foot { margin-top: auto; padding: 12px 10px; display: flex; gap: 8px; align-items: center; color: var(--sub); font-size: 12px; }
+.side-foot { margin-top: auto; padding: 12px 10px; display: flex; flex-direction: column; gap: 4px; align-items: flex-start; color: var(--sub); font-size: 12px; }
+.side-foot-row { display: flex; gap: 8px; align-items: center; }
+.app-version { padding-left: 17px; color: var(--muted); font-size: 11px; letter-spacing: .3px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
 .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .dot.off { background: var(--red); }
