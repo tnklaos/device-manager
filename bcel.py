@@ -215,9 +215,18 @@ def connect(serial, password="", username="", log=print, fresh=False):
     session actually expired. Pass fresh=True to force a clean restart."""
     d = u2.connect(serial)
     d.app_start(PKG, stop=fresh)
-    time.sleep(1.0)
-    if at_login(d):
-        do_login(d, password, username, log=log)
+    time.sleep(1.5)
+    # A "Session expired" / network-failure popup can sit IN FRONT of the login
+    # screen — dismiss it FIRST, otherwise at_login() misses it and we never
+    # re-login. Retry a few times: dismissing the popup reveals the login screen.
+    for _ in range(3):
+        by_pass_popup_network_failure(d)
+        if at_login(d):
+            do_login(d, password, username, log=log)
+            break
+        if is_home(d) or d(text="My QR").exists:
+            break
+        time.sleep(1.0)
     return d
 
 
@@ -249,11 +258,31 @@ def go_home(d, tries=5, log=lambda *_: None):
     return is_home(d)
 
 def by_pass_popup_network_failure(d):
+    """Dismiss a blocking popup in front of the dashboard/login — network failure,
+    "Session expired", etc. Tries the full-width popup button first (the common
+    case), then falls back to common confirm labels. Returns True if it clicked
+    something."""
+    # primary: the app's standard full-width popup button
     try:
-        d(resourceId="popupfullbutton").wait(timeout=3).click()
-        print("Next...")
+        el = d(text="ຕົກລົງ")
+        if el.wait(timeout=3):
+            el.click()
+            time.sleep(0.8)
+            return True
     except Exception:
-        print("Continue...")
+        pass
+    # fallback: a confirm/close button by label (covers the Session-expired dialog
+    # when it doesn't use popupfullbutton)
+    for label in ("ຕົກລົງ", "ຖືກແລ້ວ", "ຍອມຮັບ", "ປິດ", "OK", "Close"):
+        try:
+            el = d(text=label)
+            if el.exists:
+                el.click()
+                time.sleep(0.2)
+                return True
+        except Exception:
+            pass
+    return False
 
 # ----------------- actions -----------------
 def create_qr(serial, amount, description, password="", username="", submit=True,
@@ -322,6 +351,35 @@ _MSG_LABELS = {"ຫາບັນຊີ": "to_account", "ລາຍລະອຽດ"
                "ເງິນອອກ": "amount_out", "ເງິນເຂົ້າ": "amount_in", "ຈຳນວນເງິນ": "amount"}
 
 
+def row_source(sig):
+    """Extract (from_account, from_name) the money came FROM, straight from a
+    message-list row's text. The list row reliably contains this on every device
+    (the detail-page layout shifts), matching the gateway's handleAutoMateTransaction:
+      - QR / LMPS pipe statement: <type>|<bank>|<from-acct>|<bank>|<to-acct>|<name>|...
+        -> from-acct = parts[2] (parts[5] for ONEPAY), name = parts[5]
+      - regular transfer "ຈາກບັນຊີ: NAME - ACCOUNT" -> name, account
+    Returns ("", "") when there is no counterparty (e.g. own-account top-ups)."""
+    sig = re.sub(r"\s+", " ", sig or "").strip()
+    if "|" in sig:
+        # take the |-joined run, dropping any leading "...Account <own> " prefix
+        tail = re.split(r"\bAccount\s+[\dxX][\dxX\-]+\s+", sig, maxsplit=1)
+        tail = tail[-1]
+        tail = re.sub(r"(-?\s*[\d,]+(?:\.\d+)?)\s*(LAK|USD).*$", "", tail).strip()
+        parts = [p.strip() for p in tail.split("|")]
+        ttype = parts[0].upper().replace(" ", "") if parts else ""
+        idx = 5 if "ONEPAY" in ttype else 2
+        return (parts[idx] if len(parts) > idx else ""), \
+               (parts[5] if len(parts) > 5 else "")
+    mf = re.search(r"ຈາກບັນຊີ:\s*(.*?)\s*(?=ລາຍລະອຽດ:|ຫາບັນຊີ:|ເລກອ້າງອິງ:|ເລກໃບບິນ:|$)", sig)
+    if mf:
+        val = mf.group(1).strip()
+        sp = re.split(r"\s+-\s+", val, maxsplit=1)
+        if len(sp) == 2:
+            return sp[1].strip(), sp[0].strip()       # account, name
+        return val, ""
+    return "", ""
+
+
 def _extract_message_detail(d):
     """Read the open message-detail screen into a dict, incl. a unique 'ref'."""
     rec = {"type": "", "account": "", "time": "", "kind": "", "raw": []}
@@ -348,6 +406,14 @@ def _extract_message_detail(d):
             elif pending:
                 rec[pending] = t
                 pending = None
+    # Newer app builds insert a spurious brand element at raw[2] ("OneBank Kid" or
+    # a duplicate "OneBank"), pushing the real "OneBank" to raw[3] and shifting
+    # every later index — breaking the gateway's fixed lookups (raw[4]=pipe/QR,
+    # raw[5]="NAME\naccount", raw[9]=account). The real brand at raw[3] is the
+    # tell: drop raw[2] until raw[] matches canonical [MAIN, BCEL One, OneBank,
+    # MESSAGE, ...]. Old single-brand builds are unaffected.
+    while len(rec["raw"]) > 3 and rec["raw"][3] == "OneBank":
+        del rec["raw"][2]
     # reference: prefer the bill number; fall back to timestamp+type (unique)
     rec["ref"] = rec.get("bill_no") or f"{rec.get('time')}|{rec.get('type')}"
     return rec
@@ -452,19 +518,45 @@ def refresh_messages(d):
 
 def _list_rows(d):
     """Message rows currently on screen, top->bottom. Each row is classified as
-    incoming/outgoing from its amount sign in the list (outgoing = red, '-')."""
-    h = d.info.get("displayHeight", 2408)
+    incoming/outgoing from its amount sign in the list (outgoing = red, '-').
+
+    Bounds are matched RELATIVE to the screen size (not fixed pixels) so the
+    same logic works across devices with different resolutions — earlier fixed
+    thresholds (y2 < 2100) silently dropped rows on taller/denser screens, which
+    made the list look empty and the poller just kept scrolling."""
+    info = d.info
+    h = info.get("displayHeight", 2408)
+    w = info.get("displayWidth", 1080)
+
+    # Visible list area = the scrollable list container's bounds. Rows that hang
+    # below it are only partly on screen, and their center can land on the bottom
+    # tab bar — so we use the container bottom as a hard cutoff for clicks.
+    view_top, view_bottom = h * 0.09, h * 0.95
+    for el in d.xpath('//*[@scrollable="true"]').all():
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.attrib.get("bounds", ""))
+        if not m:
+            continue
+        x1, y1, x2, y2 = map(int, m.groups())
+        if (x2 - x1) >= w * 0.9 and (y2 - y1) > h * 0.2:   # the full-width list
+            view_top, view_bottom = max(view_top, y1), min(view_bottom, y2)
+            break
+
     conts = []
     for el in d.xpath('//*[@clickable="true"]').all():
         m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.attrib.get("bounds", ""))
         if not m:
             continue
         x1, y1, x2, y2 = map(int, m.groups())
-        # y1 > 240 skips the header bars (where the ☰ menu / ↻ refresh live), so
-        # a row tap can never land on the menu icon. y2 < 2100 skips the tab bar.
-        if x1 == 0 and x2 >= 1000 and 240 < y1 and y2 < 2100 and (y2 - y1) > 150:
-            conts.append((y1, y2))
-    conts.sort()
+        cy = (y1 + y2) // 2
+        # Full-width rows whose CENTER is inside the visible list viewport (above
+        # the bottom tab bar, below the header). A row hanging past the fold is
+        # skipped until it scrolls fully into view, so a click never hits a tab.
+        if (x1 <= w * 0.03 and x2 >= w * 0.9 and (y2 - y1) > h * 0.04
+                and view_top <= cy <= view_bottom):
+            # keep each row's absolute-pixel center so we can click the row by
+            # index at its real position instead of guessing coordinates.
+            conts.append((y1, y2, ((x1 + x2) // 2, cy)))
+    conts.sort(key=lambda c: c[0])
     texts = []
     for el in d.xpath('//*').all():
         t = (el.text or "").strip()
@@ -473,7 +565,7 @@ def _list_rows(d):
             x1, y1, x2, y2 = map(int, m.groups())
             texts.append(((y1 + y2) // 2, t))
     rows = []
-    for (y1, y2) in conts:
+    for (y1, y2, center) in conts:
         rt = [t for (yc, t) in texts if y1 <= yc <= y2]
         sig = " | ".join(rt)
         # the row's leading badge text is the kind code (TRI/TRO/ACC/SAL/TOP)
@@ -487,13 +579,20 @@ def _list_rows(d):
         am = re.search(r"(-?\s*[\d,]+(?:\.\d+)?)\s*(LAK|USD)", sig)
         positive = bool(am) and am.group(1).lstrip()[:1] not in ("-", "−")
         incoming = ("ໄດ້ຮັບ" in sig) or positive
-        rows.append({"cy": (y1 + y2) / 2 / h, "sig": sig, "kind": kind,
-                     "incoming": incoming})
+        # Stable dedup key from regex-extracted fields (kind + timestamp + amount).
+        # Unlike the full sig, this does NOT change when a row is partly clipped at
+        # the scroll edge, so an already-clicked message isn't re-opened/re-counted
+        # after scrolling.
+        tmatch = re.search(r"\b(\d{1,2}:\d{2}:\d{2})\b", sig)
+        key = "|".join((kind, tmatch.group(1) if tmatch else "",
+                        am.group(0).strip() if am else ""))
+        rows.append({"cy": (y1 + y2) / 2 / h, "center": center, "key": key,
+                     "sig": sig, "kind": kind, "incoming": incoming})
     return rows
 
 
 def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6,
-                  kinds=None, log=print):
+                  kinds=None, fresh=False, log=print):
     """Incremental poll for incoming transactions (transfers-in and QR/LMPS-in).
       - Classifies each list row as incoming/outgoing (received title or positive
         amount); only *incoming* rows are opened to read their detail/reference.
@@ -504,7 +603,7 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         newest incoming ref.
     Returns {first_run, last_ref, new}.
     """
-    d = connect(serial, password, username, log=log)
+    d = connect(serial, password, username, log=log, fresh=fresh)
     by_pass_popup_network_failure(d)
     open_messages_tab(d)
     refresh_messages(d)
@@ -513,8 +612,12 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         # money received: has an "ເງິນເຂົ້າ" (amount_in) value, or the title says received
         return bool(rec.get("amount_in")) or str(rec.get("type", "")).startswith("ໄດ້ຮັບ")
 
-    def read(cy):
-        d.click(0.5, cy)
+    def read(row):
+        # Click the row at its real (absolute-pixel) center taken from the row
+        # element's own bounds — robust across screen sizes. d.click() treats
+        # values >= 1 as absolute pixels (< 1 are screen fractions).
+        cx, cy = row["center"]
+        d.click(cx, cy)
         time.sleep(1.1)
         if "titletext" in d.dump_hierarchy():
             rec = _extract_message_detail(d)
@@ -532,7 +635,8 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
             time.sleep(0.5)
         return None
 
-    seen = set()
+    seen = set()           # row keys already handled (stable across scroll)
+    done_refs = set()      # detail refs already collected — guards double-send
     new, new_top = [], None
     scrolls = 0
     matched = False
@@ -540,7 +644,7 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
     while not matched and guard < 120:
         guard += 1
         rows = _list_rows(d)
-        nextrow = next((r for r in rows if r["sig"] not in seen), None)
+        nextrow = next((r for r in rows if r["key"] not in seen), None)
         if nextrow is None:                       # nothing new on screen
             # SAFEGUARD: on first run (no watermark) never scroll — we only need
             # the newest incoming to set the baseline.
@@ -551,15 +655,29 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
             d.swipe_ext("up", scale=0.7)
             time.sleep(1.2)
             scrolls += 1
-            if all(r["sig"] in seen for r in _list_rows(d)):
+            if all(r["key"] in seen for r in _list_rows(d)):
                 break                             # reached the bottom
             continue
-        seen.add(nextrow["sig"])
+        seen.add(nextrow["key"])
         if not nextrow["incoming"]:               # skip outgoing — don't open it
             continue
-        rec = read(nextrow["cy"])
+        rec = read(nextrow)                       # open detail -> real ref/bill_no
         if not rec or not detail_incoming(rec):   # confirm money received
             continue
+        # reached a transaction we already sent last time -> STOP (do NOT include it)
+        if last_ref is not None and rec["ref"] == last_ref:
+            matched = True
+            break
+        # already collected this ref in THIS poll (e.g. re-read after a scroll) ->
+        # skip so it can never be sent twice
+        if rec["ref"] in done_refs:
+            continue
+        done_refs.add(rec["ref"])
+        # source account comes from the reliable list-row text, not the detail
+        # page (whose field order shifts across devices).
+        fa, fn = row_source(nextrow["sig"])
+        if fa or fn:
+            rec["from_account"], rec["from_name"] = fa, fn
         # the newest incoming we read becomes the next watermark
         if new_top is None:
             new_top = rec["ref"]
@@ -567,10 +685,6 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         # ref as the baseline and STOP. Do not scroll, do not send any history.
         if last_ref is None:
             log(f"baseline set = {new_top}")
-            matched = True
-            break
-        # reached a transaction we already sent last time -> STOP (do NOT include it)
-        if rec["ref"] == last_ref:
             matched = True
             break
         # otherwise it's new -> collect it

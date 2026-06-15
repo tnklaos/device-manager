@@ -28,7 +28,7 @@ def cors(resp):
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok")
+    return jsonify(status="ok", version=engine.APP_VERSION)
 
 
 @app.get("/api/devices")

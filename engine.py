@@ -39,7 +39,12 @@ if getattr(sys, "frozen", False):
 else:
     SETTINGS_FILE = os.path.join(HERE, "settings.json")
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
+APP_VERSION = "1.0.1"
 MONITOR_INTERVAL = 60
+# Every 30 minutes, fully restart the BCEL app (stop + start) for the next poll.
+# This clears a stale/expired session and a frozen WebView instead of letting
+# them pile up between the lightweight 60s resume-polls.
+FRESH_RESTART_INTERVAL = 30 * 60
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -84,6 +89,9 @@ def device_online(serial):
 def source_account(t):
     """Extract the (from_account, from_name) the money was transferred FROM,
     matching the gateway's handleAutoMateTransaction logic (raw[]-based)."""
+    # Preferred: extracted from the list-row text (reliable on every device).
+    if t.get("from_account") or t.get("from_name"):
+        return (t.get("from_account", "") or "").strip(), (t.get("from_name", "") or "").strip()
     raw = t.get("raw", []) or []
     raw4 = raw[4] if len(raw) > 4 else ""
     if "|" in raw4:                       # QR / LMPS pipe statement
@@ -106,6 +114,13 @@ class Engine:
         self._status = {}         # serial -> status string
         self.transactions = []    # synced transactions (oldest first)
         self._subs = []           # SSE subscriber queues
+        # serializes settings mut-and-save across the per-device monitor threads
+        # (and Flask request threads) so concurrent writers can't corrupt the file.
+        self._slock = threading.RLock()
+
+    def _save(self):
+        with self._slock:
+            save_settings(self.settings)
 
     # ---------- event bus (SSE) ----------
     def subscribe(self):
@@ -133,8 +148,9 @@ class Engine:
         return (self.settings.get("csl", {}).get("api_url") or "").strip() or GATEWAY_API_URL
 
     def save_api_url(self, url):
-        self.settings.setdefault("csl", {})["api_url"] = (url or "").strip()
-        save_settings(self.settings)
+        with self._slock:
+            self.settings.setdefault("csl", {})["api_url"] = (url or "").strip()
+            save_settings(self.settings)
 
     def get_settings(self):
         gw = self.settings.get("csl", {})
@@ -146,11 +162,12 @@ class Engine:
         }
 
     def save_gateway(self, client_id, secret_key):
-        gw = self.settings.setdefault("csl", {})
-        gw["client_id"] = client_id or ""
-        if secret_key:
-            gw["api_key"] = secret_key
-        save_settings(self.settings)
+        with self._slock:
+            gw = self.settings.setdefault("csl", {})
+            gw["client_id"] = client_id or ""
+            if secret_key:
+                gw["api_key"] = secret_key
+            save_settings(self.settings)
 
     def setup_gateway(self):
         """Register the webhook with the gateway (POST /bcel/setup), signed with
@@ -163,8 +180,9 @@ class Engine:
         webhook = self._detect_tunnel() or gw.get("webhook", "")
         if not webhook:
             return {"ok": False, "message": "Start Sync first to get a public webhook URL"}
-        gw["webhook"] = webhook
-        save_settings(self.settings)
+        with self._slock:
+            gw["webhook"] = webhook
+            save_settings(self.settings)
         try:
             import csl_client
             ok, msg = csl_client.setup_webhook(GATEWAY_API_URL, cid, key, webhook)
@@ -177,16 +195,18 @@ class Engine:
         return self.settings.get("devices", {}).get(serial, {})
 
     def save_device_creds(self, serial, username=None, password=None):
-        dev = self.settings.setdefault("devices", {}).setdefault(serial, {})
-        if username is not None:
-            dev["username"] = username
-        if password is not None:
-            dev["password"] = password
-        save_settings(self.settings)
+        with self._slock:
+            dev = self.settings.setdefault("devices", {}).setdefault(serial, {})
+            if username is not None:
+                dev["username"] = username
+            if password is not None:
+                dev["password"] = password
+            save_settings(self.settings)
 
     def set_last_ref(self, serial, ref):
-        self.settings.setdefault("devices", {}).setdefault(serial, {})["last_ref"] = ref
-        save_settings(self.settings)
+        with self._slock:
+            self.settings.setdefault("devices", {}).setdefault(serial, {})["last_ref"] = ref
+            save_settings(self.settings)
 
     # ---------- devices ----------
     def devices(self):
@@ -233,6 +253,7 @@ class Engine:
     def _loop(self, serial, m):
         creds = self.device_creds(serial)
         pwd, user = creds.get("password", ""), creds.get("username", "")
+        last_fresh = 0.0      # forces a fresh app restart on the very first poll
         while m["active"]:
             if not device_online(serial):
                 self._set_status(serial, "disconnected")
@@ -241,8 +262,14 @@ class Engine:
                 return
             try:
                 last_ref = self.device_creds(serial).get("last_ref") or None
+                # Restart the app cleanly every 30 min (and on first poll) to drop
+                # any expired session / frozen WebView before reading.
+                fresh = (time.time() - last_fresh) >= FRESH_RESTART_INTERVAL
+                if fresh:
+                    last_fresh = time.time()
+                    self.log(f"↻ {serial}: fresh app restart (30-min cycle)")
                 self.log(f"⟳ {serial}: refreshing messages…")
-                res = bcel.poll_messages(serial, last_ref, pwd, user,
+                res = bcel.poll_messages(serial, last_ref, pwd, user, fresh=fresh,
                                          log=lambda msg: self.log(f"   {serial}: {msg}"))
                 new = res.get("new") or []
                 if new:
@@ -266,8 +293,9 @@ class Engine:
 
     # ---------- sync (public tunnel via ngrok) ----------
     def save_token(self, token):
-        self.settings["ngrok_token"] = token or ""
-        save_settings(self.settings)
+        with self._slock:
+            self.settings["ngrok_token"] = token or ""
+            save_settings(self.settings)
 
     def _detect_tunnel(self):
         try:
@@ -328,8 +356,9 @@ class Engine:
             return {"ok": False, "message": "Enter Client ID and Secret Key first"}
         if not hook:
             return {"ok": False, "message": "Start Sync first to get a public URL"}
-        self.settings.setdefault("csl", {})["webhook"] = hook
-        save_settings(self.settings)
+        with self._slock:
+            self.settings.setdefault("csl", {})["webhook"] = hook
+            save_settings(self.settings)
         try:
             ok, msg = csl_client.setup_webhook(GATEWAY_API_URL, cid, key, hook)
             self.log(f"/bcel/setup → {msg}")
@@ -382,6 +411,18 @@ class Engine:
         cid = (gw.get("client_id") or "").strip()
         key = (gw.get("api_key") or "").strip()
         txns = [{**t, "serial": serial} for t in new]
+        # Newer app builds insert a spurious brand element at raw[2] ("OneBank Kid"
+        # or a duplicate "OneBank"), pushing the real "OneBank" to raw[3] and
+        # shifting every later index — which breaks the gateway's fixed raw[]
+        # lookups. The real brand at raw[3] is the tell: drop raw[2] until raw[]
+        # matches the canonical format ([MAIN, BCEL One, OneBank, MESSAGE, ...]).
+        for t in txns:
+            raw = t.get("raw")
+            if isinstance(raw, list):
+                raw = list(raw)
+                while len(raw) > 3 and raw[3] == "OneBank":
+                    del raw[2]
+                t["raw"] = raw
         if not (cid and key):
             self.log(f"⚠ {serial}: gateway credentials missing — not sent")
             return
