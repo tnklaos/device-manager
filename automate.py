@@ -12,7 +12,7 @@ import os
 import sys
 import bcel
 
-serial = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SERIAL", "192.168.100.7:38245")
+serial = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SERIAL", "R8YY40Y3W4L")
 amount = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("AMOUNT", "200000")
 description = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("DESCRIPTION", "444")
 password = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("PASSWORD", "Pk1234")

@@ -32,8 +32,13 @@
     },
     "192.168.100.7:38245": {
       "username": "",
-      "password": "Pk1234",
+      "password": "",
       "last_ref": "202606144125198"
+    },
+    "R8YY40Y3W4L": {
+      "username": "",
+      "password": "",
+      "last_ref": ""
     }
   },
   "csl": {

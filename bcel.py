@@ -248,6 +248,12 @@ def go_home(d, tries=5, log=lambda *_: None):
         time.sleep(0.4)
     return is_home(d)
 
+def by_pass_popup_network_failure(d):
+    try:
+        d(resourceId="popupfullbutton").wait(timeout=3).click()
+        print("Next...")
+    except Exception:
+        print("Continue...")
 
 # ----------------- actions -----------------
 def create_qr(serial, amount, description, password="", username="", submit=True,
@@ -499,6 +505,7 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
     Returns {first_run, last_ref, new}.
     """
     d = connect(serial, password, username, log=log)
+    by_pass_popup_network_failure(d)
     open_messages_tab(d)
     refresh_messages(d)
 
@@ -577,6 +584,7 @@ def get_messages(serial, password="", username="", max_scrolls=8, log=print):
     LABELS = {"ຫາບັນຊີ": "to_account", "ລາຍລະອຽດ": "details", "ເລກໃບບິນ": "bill_no",
               "ເງິນອອກ": "amount_out", "ເງິນເຂົ້າ": "amount_in", "ຈຳນວນເງິນ": "amount"}
     d = connect(serial, password, username, log=log)
+    by_pass_popup_network_failure(d)
     d(text='ຂໍ້ຄວາມ').click()
     time.sleep(1.5)
 
