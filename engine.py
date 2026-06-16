@@ -8,6 +8,7 @@ transactions) to subscribers for the UI's SSE stream.
 import os
 import json
 import time
+import uuid
 import queue
 import threading
 import subprocess
@@ -39,7 +40,7 @@ if getattr(sys, "frozen", False):
 else:
     SETTINGS_FILE = os.path.join(HERE, "settings.json")
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 MONITOR_INTERVAL = 60
 # Every 30 minutes, fully restart the BCEL app (stop + start) for the next poll.
 # This clears a stale/expired session and a frozen WebView instead of letting
@@ -143,51 +144,90 @@ class Engine:
     def log(self, msg):
         self.emit("log", {"msg": msg})
 
-    # ---------- settings ----------
-    def api_url(self):
-        return (self.settings.get("csl", {}).get("api_url") or "").strip() or GATEWAY_API_URL
-
-    def save_api_url(self, url):
-        with self._slock:
-            self.settings.setdefault("csl", {})["api_url"] = (url or "").strip()
-            save_settings(self.settings)
-
+    # ---------- settings (global) ----------
     def get_settings(self):
-        gw = self.settings.get("csl", {})
         return {
-            "client_id": gw.get("client_id", ""),
-            "has_secret": bool(gw.get("api_key")),
             "ngrok_token_set": bool(self.settings.get("ngrok_token")),
-            "api_url": self.api_url(),
+            "default_api_url": GATEWAY_API_URL,
         }
 
-    def save_gateway(self, client_id, secret_key):
-        with self._slock:
-            gw = self.settings.setdefault("csl", {})
-            gw["client_id"] = client_id or ""
-            if secret_key:
-                gw["api_key"] = secret_key
-            save_settings(self.settings)
+    # ---------- setting sets (named gateway profiles) ----------
+    def sets(self):
+        """All gateway profiles (secrets redacted to a has_secret flag)."""
+        out = []
+        for sid, s in self.settings.get("sets", {}).items():
+            out.append({
+                "id": sid,
+                "name": s.get("name", ""),
+                "client_id": s.get("client_id", ""),
+                "has_secret": bool(s.get("api_key")),
+                "api_url": s.get("api_url", "") or GATEWAY_API_URL,
+            })
+        return out
 
-    def setup_gateway(self):
-        """Register the webhook with the gateway (POST /bcel/setup), signed with
-        the saved credentials. The webhook is the current public Sync URL."""
-        gw = self.settings.get("csl", {})
-        cid = (gw.get("client_id") or "").strip()
-        key = (gw.get("api_key") or "").strip()
-        if not (cid and key):
-            return {"ok": False, "message": "Enter Client ID and Secret Key first"}
-        webhook = self._detect_tunnel() or gw.get("webhook", "")
-        if not webhook:
-            return {"ok": False, "message": "Start Sync first to get a public webhook URL"}
+    def save_set(self, set_id, name, client_id, secret, api_url):
+        """Create (blank set_id) or update a gateway profile. Returns its id.
+        A blank secret on update keeps the stored one."""
         with self._slock:
-            gw["webhook"] = webhook
+            sets = self.settings.setdefault("sets", {})
+            if not set_id:
+                set_id = uuid.uuid4().hex[:8]
+            s = sets.setdefault(set_id, {})
+            s["name"] = (name or s.get("name") or "Untitled").strip()
+            s["client_id"] = (client_id or "").strip()
+            if secret:
+                s["api_key"] = secret.strip()
+            s["api_url"] = (api_url or "").strip()
             save_settings(self.settings)
+        return set_id
+
+    def delete_set(self, set_id):
+        with self._slock:
+            self.settings.get("sets", {}).pop(set_id, None)
+            # unassign any device that pointed to it
+            for dev in self.settings.get("devices", {}).values():
+                if dev.get("set") == set_id:
+                    dev.pop("set", None)
+            save_settings(self.settings)
+        return {"ok": True}
+
+    def device_set(self, serial):
+        """The gateway profile assigned to a device, or None."""
+        sid = self.device_creds(serial).get("set")
+        return self.settings.get("sets", {}).get(sid) if sid else None
+
+    def assign_device_set(self, serial, set_id):
+        with self._slock:
+            dev = self.settings.setdefault("devices", {}).setdefault(serial, {})
+            if set_id:
+                dev["set"] = set_id
+            else:
+                dev.pop("set", None)
+            save_settings(self.settings)
+        return {"ok": True}
+
+    def setup_set_webhook(self, set_id):
+        """Register the current public Sync URL as this set's webhook with the
+        gateway (POST /bcel/setup), signed with the set's own credentials."""
+        s = self.settings.get("sets", {}).get(set_id)
+        if not s:
+            return {"ok": False, "message": "Set not found"}
+        cid = (s.get("client_id") or "").strip()
+        key = (s.get("api_key") or "").strip()
+        if not (cid and key):
+            return {"ok": False, "message": "Set is missing Client ID / Secret Key"}
+        # The webhook/Sync URL is optional — call /bcel/setup regardless so the
+        # credentials still get verified. Use a public URL if one happens to be up.
+        hook = (self._detect_tunnel() or self.settings.get("webhook") or s.get("webhook") or "").strip()
+        api_url = (s.get("api_url") or "").strip() or GATEWAY_API_URL
+        if hook:
+            with self._slock:
+                s["webhook"] = hook
+                save_settings(self.settings)
         try:
-            import csl_client
-            ok, msg = csl_client.setup_webhook(GATEWAY_API_URL, cid, key, webhook)
-            self.log(f"/bcel/setup: {msg}")
-            return {"ok": ok, "message": msg, "webhook": webhook}
+            ok, msg = csl_client.setup_webhook(api_url, cid, key, hook)
+            self.log(f"/bcel/setup [{s.get('name')}] → {msg}")
+            return {"ok": ok, "message": msg, "webhook": hook}
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
@@ -220,6 +260,7 @@ class Engine:
                 "has_creds": bool(self.device_creds(s).get("password")),
                 "last_ref": self.device_creds(s).get("last_ref", ""),
                 "username": self.device_creds(s).get("username", ""),
+                "set": self.device_creds(s).get("set", ""),
             })
         return out
 
@@ -346,26 +387,6 @@ class Engine:
         self.log("Sync stopped")
         return {"ok": True}
 
-    # ---------- gateway /bcel/setup (register webhook) ----------
-    def setup_webhook(self, webhook=None):
-        gw = self.settings.get("csl", {})
-        cid = (gw.get("client_id") or "").strip()
-        key = (gw.get("api_key") or "").strip()
-        hook = (webhook or self._detect_tunnel() or gw.get("webhook") or "").strip()
-        if not (cid and key):
-            return {"ok": False, "message": "Enter Client ID and Secret Key first"}
-        if not hook:
-            return {"ok": False, "message": "Start Sync first to get a public URL"}
-        with self._slock:
-            self.settings.setdefault("csl", {})["webhook"] = hook
-            save_settings(self.settings)
-        try:
-            ok, msg = csl_client.setup_webhook(GATEWAY_API_URL, cid, key, hook)
-            self.log(f"/bcel/setup → {msg}")
-            return {"ok": ok, "message": msg, "webhook": hook}
-        except Exception as e:
-            return {"ok": False, "message": str(e)}
-
     # ---------- device actions ----------
     def mirror(self, serial):
         subprocess.Popen(["scrcpy", "--serial", serial, "--window-title", serial],
@@ -407,9 +428,10 @@ class Engine:
         return {"payload": payload, "qr_png": self._qr_png(payload)}
 
     def _send(self, serial, new):
-        gw = self.settings.get("csl", {})
-        cid = (gw.get("client_id") or "").strip()
-        key = (gw.get("api_key") or "").strip()
+        s = self.device_set(serial)
+        cid = (s.get("client_id") or "").strip() if s else ""
+        key = (s.get("api_key") or "").strip() if s else ""
+        api_url = ((s.get("api_url") or "").strip() if s else "") or GATEWAY_API_URL
         txns = [{**t, "serial": serial} for t in new]
         # Newer app builds insert a spurious brand element at raw[2] ("OneBank Kid"
         # or a duplicate "OneBank"), pushing the real "OneBank" to raw[3] and
@@ -423,11 +445,14 @@ class Engine:
                 while len(raw) > 3 and raw[3] == "OneBank":
                     del raw[2]
                 t["raw"] = raw
+        if not s:
+            self.log(f"⚠ {serial}: no setting set assigned — not sent (assign one on the device card)")
+            return
         if not (cid and key):
-            self.log(f"⚠ {serial}: gateway credentials missing — not sent")
+            self.log(f"⚠ {serial}: set '{s.get('name')}' is missing credentials — not sent")
             return
         try:
-            ok, msg = csl_client.post_transactions(GATEWAY_API_URL, cid, key, txns, timeout=10)
+            ok, msg = csl_client.post_transactions(api_url, cid, key, txns, timeout=10)
             self.log(f"→ {serial}: synced {len(txns)} transaction(s): {msg}")
             if ok:
                 for t in txns:

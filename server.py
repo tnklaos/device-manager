@@ -62,13 +62,34 @@ def get_settings():
     return jsonify(eng.get_settings())
 
 
-@app.post("/api/settings")
-def post_settings():
+# ---------- setting sets (named gateway profiles) ----------
+@app.get("/api/sets")
+def get_sets():
+    return jsonify(eng.sets())
+
+
+@app.post("/api/sets")
+def save_set():
     b = request.get_json(force=True, silent=True) or {}
-    eng.save_gateway(b.get("client_id", ""), b.get("secret_key", ""))
-    # like the Python app's "Save & Setup": register the webhook via /bcel/setup
-    setup = eng.setup_webhook(b.get("webhook"))
-    return jsonify(ok=True, setup=setup)
+    set_id = eng.save_set(b.get("id"), b.get("name", ""), b.get("client_id", ""),
+                          b.get("secret_key", ""), b.get("api_url", ""))
+    return jsonify(ok=True, id=set_id)
+
+
+@app.post("/api/sets/<set_id>/delete")
+def delete_set(set_id):
+    return jsonify(eng.delete_set(set_id))
+
+
+@app.post("/api/sets/<set_id>/webhook")
+def set_webhook(set_id):
+    return jsonify(eng.setup_set_webhook(set_id))
+
+
+@app.post("/api/devices/<path:serial>/set")
+def assign_set(serial):
+    b = request.get_json(force=True, silent=True) or {}
+    return jsonify(eng.assign_device_set(serial, b.get("set_id") or ""))
 
 
 @app.post("/api/devices/<path:serial>/mirror")
