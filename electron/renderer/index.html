@@ -73,22 +73,33 @@
       </section>
 
       <section id="view-settings" class="view hidden">
-        <div class="card form-card">
-          <h2>Payment Gateway</h2>
-          <p class="muted">Credentials used to sign transactions sent to the gateway.</p>
+        <!-- tabbed items: one tab per gateway set, plus global Sync -->
+        <div class="settabs" id="settabs"></div>
+
+        <!-- a set's editor -->
+        <div id="set-editor" class="card form-card">
+          <div class="set-editor-head">
+            <h2 id="set-editor-title">Gateway Set</h2>
+            <button id="set-delete" class="btn red sm" title="Delete this set">Delete</button>
+          </div>
+          <p class="muted">A named gateway profile. Assign devices to it on the Devices page.</p>
+          <label>Set name</label>
+          <input id="set-name" type="text" placeholder="e.g. Client A" />
           <label>Client ID</label>
           <input id="set-client" type="text" placeholder="client id" />
           <label>Secret Key</label>
-          <input id="set-secret" type="password" placeholder="leave blank to keep current" />
+          <input id="set-secret" type="password" placeholder="secret key" />
           <div class="row-actions">
             <button id="set-save" class="btn primary">Save</button>
+            <button id="set-register" class="btn ghost">Register webhook</button>
             <span id="set-status" class="muted"></span>
           </div>
         </div>
 
-        <div class="card form-card" style="margin-top:16px">
+        <!-- global Sync (shared by all sets) -->
+        <div id="sync-editor" class="card form-card hidden" style="margin-top:16px">
           <h2>Sync <span id="sync-dot" class="dot off" style="display:inline-block;vertical-align:middle"></span></h2>
-          <p class="muted">Expose the local API over a public HTTPS URL (optional).</p>
+          <p class="muted">Expose the local API over one public HTTPS URL, shared by all sets (optional).</p>
           <label>Sync Token</label>
           <input id="sync-token" type="password" placeholder="ngrok auth token" />
           <div class="row-actions">
