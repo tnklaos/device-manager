@@ -41,7 +41,7 @@ if getattr(sys, "frozen", False):
 else:
     SETTINGS_FILE = os.path.join(HERE, "settings.json")
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 MONITOR_INTERVAL = 60
 # Fully restart the BCEL app (stop + start) every Nth poll cycle, per device.
 # This clears a stale/expired session and a frozen WebView instead of letting
