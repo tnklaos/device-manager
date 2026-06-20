@@ -79,6 +79,7 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 .badge.disconnected { background: #3a1620; color: #fecaca; }
 .devcard .meta { color: var(--sub); font-size: 12px; margin: 12px 0; display: flex; gap: 14px; }
 .devcard .meta .ok { color: var(--green); }
+.devcard .meta .warn { color: #f59e0b; }
 .devcard .actions { display: flex; gap: 6px; flex-wrap: nowrap; align-items: center; }
 .devcard .actions .btn { flex-shrink: 0; }
 

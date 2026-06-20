@@ -15,6 +15,7 @@ import os
 import re
 import time
 import subprocess
+import xml.etree.ElementTree as ET
 import uiautomator2 as u2
 
 PKG = "com.bcel.bcelone"
@@ -26,10 +27,17 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 # ----------------- notification reading (pure adb, no agent) -----------------
-def _adb(serial, *args):
-    return subprocess.run(["adb", "-s", serial, *args],
-                          capture_output=True, text=True,
-                          creationflags=NO_WINDOW).stdout
+def _adb(serial, *args, timeout=20):
+    # bound the call: a per-device `adb -s <ip:port> shell ...` can hang when the
+    # device drops off Wi-Fi mid-command. On timeout/failure return "".
+    try:
+        return subprocess.run(["adb", "-s", serial, *args],
+                              capture_output=True, text=True,
+                              creationflags=NO_WINDOW, timeout=timeout).stdout
+    except subprocess.TimeoutExpired:
+        return ""
+    except Exception:
+        return ""
 
 
 def read_notifications(serial, pkg=PKG):
@@ -464,48 +472,29 @@ def open_messages_tab(d):
             break
 
 
+def _wait_list_settled(d, timeout=12, poll=0.6):
+    """Wait until the message list has finished (re)loading: rows are present and
+    the top row is unchanged across two consecutive reads (i.e. the fetch settled).
+    Returns True once stable. Used after a refresh/scroll so we don't read a list
+    that is still loading on a slow connection."""
+    deadline = time.time() + timeout
+    prev = None
+    while time.time() < deadline:
+        rows = _list_rows(d)
+        top = rows[0]["key"] if rows else None
+        if top and top == prev:
+            return True                 # non-empty and unchanged -> settled
+        prev = top
+        time.sleep(poll)
+    return bool(_list_rows(d))
+
+
 def refresh_messages(d):
-    d.xpath('//*[@resource-id="titlecontext"]').click()
-    # """Tap the message refresh icon without relying on one fixed offset."""
-    # display_width = d.info.get("displayWidth", 1080)
-    # display_height = d.info.get("displayHeight", 2408)
-
-    # title_candidates = []
-    # for el in d.xpath('//*').all():
-    #     if (el.text or "").strip() == "ຂໍ້ຄວາມ":
-    #         bounds = _parse_bounds(el.attrib.get("bounds", ""))
-    #         if bounds:
-    #             title_candidates.append(bounds)
-    # title_bounds = next(
-    #     (bounds for bounds in sorted(title_candidates, key=lambda item: item[1])
-    #      if bounds[1] < display_height * 0.4),
-    #     title_candidates[0] if title_candidates else None)
-
-    # title_center_y = ((title_bounds[1] + title_bounds[3]) // 2
-    #                   if title_bounds else int(display_height * 0.125))
-    # y_tolerance = (max(80, (title_bounds[3] - title_bounds[1]) * 1.3)
-    #                if title_bounds else display_height * 0.06)
-    # candidates = []
-    # for el in d.xpath('//*[@clickable="true"]').all():
-    #     bounds = _parse_bounds(el.attrib.get("bounds", ""))
-    #     if not bounds:
-    #         continue
-    #     left, top, right, bottom = bounds
-    #     center_x, center_y = (left + right) // 2, (top + bottom) // 2
-    #     if center_x < display_width * 0.75:
-    #         continue
-    #     if abs(center_y - title_center_y) > y_tolerance:
-    #         continue
-    #     if bottom - top > display_height * 0.12:
-    #         continue
-    #     candidates.append((center_x, center_y))
-
-    # if candidates:
-    #     center_x, center_y = sorted(candidates, reverse=True)[0]
-    #     d.click(center_x, center_y)
-    # else:
-    #     d.click(0.93, title_center_y / display_height)
-    time.sleep(2.0)
+    d.xpath('//*[@resource-id="titlecontext"]').click()   # tap the ↻ refresh icon
+    # Wait for the reload to actually land (non-empty + stable) instead of a fixed
+    # sleep — on slow internet the fetch can still be in flight after 2s, leaving
+    # the list empty/loading and making the poll read nothing.
+    _wait_list_settled(d)
     # Scroll back to the very top so every cycle reads from the NEWEST message.
     # Without this, a list left scrolled-down from the previous cycle makes the
     # poll read older transactions (ref != last_ref) as if they were new and keep
@@ -513,7 +502,8 @@ def refresh_messages(d):
     for _ in range(3):
         d.swipe_ext("down", scale=0.8)
         time.sleep(0.3)
-    time.sleep(0.4)
+    # let the top settle after scrolling before the poll reads it
+    _wait_list_settled(d, timeout=4)
 
 
 def _list_rows(d):
@@ -528,25 +518,35 @@ def _list_rows(d):
     h = info.get("displayHeight", 2408)
     w = info.get("displayWidth", 1080)
 
+    # ONE hierarchy snapshot per call (not three separate xpath dumps): faster over
+    # Wi-Fi and — crucially — a single consistent view so the viewport, the
+    # clickable rows, and their text can't disagree because the list shifted
+    # between dumps (which previously caused off-by-one taps).
+    try:
+        root = ET.fromstring(d.dump_hierarchy())
+    except Exception:
+        return []
+    parsed = []   # (x1, y1, x2, y2, attrib) for every node with valid bounds
+    for el in root.iter("node"):
+        a = el.attrib
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", a.get("bounds", ""))
+        if m:
+            x1, y1, x2, y2 = map(int, m.groups())
+            parsed.append((x1, y1, x2, y2, a))
+
     # Visible list area = the scrollable list container's bounds. Rows that hang
     # below it are only partly on screen, and their center can land on the bottom
     # tab bar — so we use the container bottom as a hard cutoff for clicks.
     view_top, view_bottom = h * 0.09, h * 0.95
-    for el in d.xpath('//*[@scrollable="true"]').all():
-        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.attrib.get("bounds", ""))
-        if not m:
-            continue
-        x1, y1, x2, y2 = map(int, m.groups())
-        if (x2 - x1) >= w * 0.9 and (y2 - y1) > h * 0.2:   # the full-width list
+    for (x1, y1, x2, y2, a) in parsed:
+        if a.get("scrollable") == "true" and (x2 - x1) >= w * 0.9 and (y2 - y1) > h * 0.2:
             view_top, view_bottom = max(view_top, y1), min(view_bottom, y2)
             break
 
     conts = []
-    for el in d.xpath('//*[@clickable="true"]').all():
-        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.attrib.get("bounds", ""))
-        if not m:
+    for (x1, y1, x2, y2, a) in parsed:
+        if a.get("clickable") != "true":
             continue
-        x1, y1, x2, y2 = map(int, m.groups())
         cy = (y1 + y2) // 2
         # Full-width rows whose CENTER is inside the visible list viewport (above
         # the bottom tab bar, below the header). A row hanging past the fold is
@@ -558,11 +558,9 @@ def _list_rows(d):
             conts.append((y1, y2, ((x1 + x2) // 2, cy)))
     conts.sort(key=lambda c: c[0])
     texts = []
-    for el in d.xpath('//*').all():
-        t = (el.text or "").strip()
-        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.attrib.get("bounds", ""))
-        if t and m:
-            x1, y1, x2, y2 = map(int, m.groups())
+    for (x1, y1, x2, y2, a) in parsed:
+        t = (a.get("text") or "").strip()
+        if t:
             texts.append(((y1 + y2) // 2, t))
     rows = []
     for (y1, y2, center) in conts:
@@ -591,6 +589,39 @@ def _list_rows(d):
     return rows
 
 
+def _amount_value(text):
+    """Numeric value of an amount, ignoring formatting. The list shows '2,000 LAK'
+    while the detail shows '2,000.00 LAK' — both normalize to 2000.0."""
+    m = re.search(r"(-?\s*[\d,]+(?:\.\d+)?)\s*(?:LAK|USD)", text or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "").replace(" ", ""))
+    except ValueError:
+        return None
+
+
+def _hhmmss(text):
+    m = re.search(r"\b(\d{1,2}:\d{2}:\d{2})\b", text or "")
+    return m.group(1) if m else ""
+
+
+def detail_matches_row(row_sig, rec):
+    """Verify the opened detail belongs to the row that was clicked, by comparing
+    the amount and the HH:MM:SS timestamp that appear in BOTH the list row and the
+    detail. A *conflict* on either means the tap opened the wrong transaction
+    (off-by-one, list shifted mid-tap); we require at least one positive match and
+    zero conflicts. This guards against recording the wrong amount/ref."""
+    ra = _amount_value(row_sig)
+    da = _amount_value(rec.get("amount_in") or rec.get("amount") or "")
+    rt, dt = _hhmmss(row_sig), _hhmmss(rec.get("time") or "")
+    if ra is not None and da is not None and ra != da:
+        return False                      # amount conflict -> wrong detail
+    if rt and dt and rt != dt:
+        return False                      # time conflict -> wrong detail
+    return bool((ra is not None and da is not None and ra == da) or (rt and dt and rt == dt))
+
+
 def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6,
                   kinds=None, fresh=False, log=print):
     """Incremental poll for incoming transactions (transfers-in and QR/LMPS-in).
@@ -613,26 +644,44 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         return bool(rec.get("amount_in")) or str(rec.get("type", "")).startswith("ໄດ້ຮັບ")
 
     def read(row):
-        # Click the row at its real (absolute-pixel) center taken from the row
-        # element's own bounds — robust across screen sizes. d.click() treats
-        # values >= 1 as absolute pixels (< 1 are screen fractions).
-        cx, cy = row["center"]
-        d.click(cx, cy)
-        time.sleep(1.1)
-        if "titletext" in d.dump_hierarchy():
-            rec = _extract_message_detail(d)
-            try:
-                d(text="Close").click()
-            except Exception:
+        # Open a row's detail, WAIT until it has fully rendered, then VERIFY it's
+        # the one we clicked (amount + time must match the list row). Two hazards
+        # under slow internet / slow app:
+        #   1) the detail opens late -> never read the list as if the tap missed;
+        #   2) the detail renders half-loaded -> the bill number isn't there yet and
+        #      we'd record a fallback ref. So we poll for the detail AND its value
+        #      fields (amount) before accepting, up to a timeout, instead of a fixed
+        #      sleep. On mismatch/incomplete we retry; we never return partial/wrong.
+        for attempt in range(3):
+            # re-locate the row by its stable key (its pixel center may have moved)
+            cur = next((r for r in _list_rows(d) if r["key"] == row["key"]), None)
+            if cur is None:
+                return None                       # row scrolled away — let caller move on
+            d.click(*cur["center"])
+            rec, opened = None, False
+            deadline = time.time() + 10           # wait up to 10s for a slow load
+            while time.time() < deadline:
+                time.sleep(0.5)
+                r = _extract_message_detail(d)
+                if r.get("type"):                 # detail container is on screen
+                    opened = True
+                    if r.get("amount_in") or r.get("amount"):
+                        rec = r                   # value fields rendered -> fully loaded
+                        break
+            if opened:                            # close the detail we opened
+                try:
+                    d(text="Close").click()
+                except Exception:
+                    d.press("back")
+                time.sleep(0.6)
+            if rec and detail_matches_row(row["sig"], rec):
+                return rec                        # verified + complete
+            log(f"detail not ready/mismatch for {row['key']} (attempt {attempt + 1}/3) — retrying")
+            # if the tap never opened a detail and we left the list, get back to it
+            if not opened and not _list_rows(d):
                 d.press("back")
-            time.sleep(0.7)
-            return rec
-        # tap didn't open a detail. Only press Back if we actually LEFT the list
-        # (a stray menu/popup) — not when the tap merely missed, otherwise Back
-        # would navigate away from Messages and derail the cycle.
-        if not _list_rows(d):
-            d.press("back")
-            time.sleep(0.5)
+                time.sleep(0.5)
+        log(f"⚠ could not read a complete matching detail for {row['key']} — skipped this cycle")
         return None
 
     seen = set()           # row keys already handled (stable across scroll)

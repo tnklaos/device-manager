@@ -1,9 +1,36 @@
 {
   "ngrok_token": "",
   "devices": {
+    "R5CT82YM38H": {
+      "set": "acb68231",
+      "username": "",
+      "password": "Raj@261197",
+      "last_ref": ""
+    },
+    "R8YY40Y3W4L": {
+      "username": "",
+      "password": "Pk1234",
+      "last_ref": "202606175502637",
+      "set": "acb68231"
+    },
+    "3463511727001CN": {
+      "set": "acb68231",
+      "username": "",
+      "password": "Pk1234",
+      "last_ref": "202606203597032"
+    }
   },
   "csl": {},
   "sets": {
-    
-  }
+    "acb68231": {
+      "name": "CSLDOME",
+      "client_id": "894019c1-1289-47d5-a74d-105127505752",
+      "api_key": "05790f1d-fd58-4652-9c08-cddf9438c1e4",
+      "api_url": ""
+    }
+  },
+  "sent_refs": [
+    "20260620544200",
+    "202606203597032"
+  ]
 }

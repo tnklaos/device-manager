@@ -12,6 +12,7 @@ import uuid
 import queue
 import threading
 import subprocess
+import collections
 
 import bcel
 import csl_client
@@ -42,10 +43,15 @@ else:
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
 APP_VERSION = "1.0.2"
 MONITOR_INTERVAL = 60
-# Every 30 minutes, fully restart the BCEL app (stop + start) for the next poll.
+# Fully restart the BCEL app (stop + start) every Nth poll cycle, per device.
 # This clears a stale/expired session and a frozen WebView instead of letting
-# them pile up between the lightweight 60s resume-polls.
-FRESH_RESTART_INTERVAL = 30 * 60
+# them pile up between the lightweight resume-polls. At a 60s interval, 30 cycles
+# ≈ 30 minutes. The cycle count is tracked globally per device (Engine._cycles)
+# so it survives a monitor stop/start instead of resetting each time.
+FRESH_RESTART_CYCLES = 30
+# How many consecutive "not reachable" cycles to tolerate before stopping a
+# monitor — lets a brief Wi-Fi/internet drop recover instead of killing it.
+OFFLINE_TOLERANCE = 3
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -62,19 +68,30 @@ def save_settings(data):
         json.dump(data, f, indent=2)
 
 
-def adb(*args):
-    return subprocess.run(["adb", *args], capture_output=True, text=True,
-                          creationflags=_NO_WINDOW).stdout
+def adb(*args, timeout=15):
+    # Always bound the call: a flaky Wi-Fi device can wedge the adb server, and
+    # without a timeout subprocess.run would hang the monitor thread AND the
+    # /api/devices UI call forever. On timeout/failure return "" (treated as "no
+    # output") so callers degrade gracefully instead of blocking.
+    try:
+        return subprocess.run(["adb", *args], capture_output=True, text=True,
+                               creationflags=_NO_WINDOW, timeout=timeout).stdout
+    except subprocess.TimeoutExpired:
+        return ""
+    except Exception:
+        return ""
 
 
 def list_devices():
-    out = adb("devices", "-l")
+    out = adb("devices", "-l", timeout=10)
     res = []
     for line in out.splitlines()[1:]:
         line = line.strip()
         if not line or "_adb-tls-" in line:
             continue
         parts = line.split()
+        if len(parts) < 2:                    # malformed line — skip, don't crash
+            continue
         serial, state = parts[0], parts[1]
         model = next((p.split(":", 1)[1].replace("_", " ")
                       for p in parts[2:] if p.startswith("model:")), "Android device")
@@ -85,6 +102,23 @@ def list_devices():
 def device_online(serial):
     return any(d["serial"] == serial and d["state"] == "device"
                for d in list_devices())
+
+
+def device_state(serial):
+    """The adb state for a serial: 'device', 'unauthorized', 'offline', or None
+    (not present). Only 'device' is actually usable."""
+    for d in list_devices():
+        if d["serial"] == serial:
+            return d["state"]
+    return None
+
+
+# human-readable reason a device isn't usable, keyed by adb state
+_STATE_REASON = {
+    "unauthorized": "unauthorized — tap Allow (USB debugging) on the phone, then Start again",
+    "offline": "offline — unplug/replug or reconnect the device",
+    None: "not connected",
+}
 
 
 def source_account(t):
@@ -113,11 +147,21 @@ class Engine:
         self.settings = load_settings()
         self._monitors = {}       # serial -> {"active": bool, "thread": Thread}
         self._status = {}         # serial -> status string
+        self._cycles = {}         # serial -> current poll-cycle count (global, all devices)
         self.transactions = []    # synced transactions (oldest first)
         self._subs = []           # SSE subscriber queues
         # serializes settings mut-and-save across the per-device monitor threads
         # (and Flask request threads) so concurrent writers can't corrupt the file.
         self._slock = threading.RLock()
+        # global guard against ever posting the same bank reference twice (across
+        # cycles, fresh restarts, and multiple devices). Bounded, newest-last, and
+        # persisted (a tail) to settings so it also survives a full app restart.
+        self._sent_refs = collections.OrderedDict()
+        self._sent_lock = threading.Lock()
+        self._SENT_MAX = 10000          # kept in memory
+        self._SENT_PERSIST = 3000       # kept on disk
+        for k in self.settings.get("sent_refs", []):
+            self._sent_refs[k] = True
 
     def _save(self):
         with self._slock:
@@ -261,6 +305,7 @@ class Engine:
                 "last_ref": self.device_creds(s).get("last_ref", ""),
                 "username": self.device_creds(s).get("username", ""),
                 "set": self.device_creds(s).get("set", ""),
+                "cycle": self._cycles.get(s, 0),
             })
         return out
 
@@ -273,6 +318,13 @@ class Engine:
     # ---------- monitor control ----------
     def start(self, serial):
         if self._monitors.get(serial, {}).get("active"):
+            return
+        # don't spin up a monitor for a device adb can't actually drive
+        st = device_state(serial)
+        if st != "device":
+            reason = _STATE_REASON.get(st, f"state '{st}'")
+            self._set_status(serial, "unauthorized" if st == "unauthorized" else "disconnected")
+            self.log(f"⚠ {serial}: {reason}")
             return
         m = {"active": True}
         self._monitors[serial] = m
@@ -294,36 +346,67 @@ class Engine:
     def _loop(self, serial, m):
         creds = self.device_creds(serial)
         pwd, user = creds.get("password", ""), creds.get("username", "")
-        last_fresh = 0.0      # forces a fresh app restart on the very first poll
+        offline = 0                              # consecutive non-'device' readings
         while m["active"]:
-            if not device_online(serial):
-                self._set_status(serial, "disconnected")
-                m["active"] = False
-                self.log(f"⚠ {serial}: disconnected — monitor stopped")
-                return
+            st = device_state(serial)
+            if st != "device":
+                # 'unauthorized' needs a human (tap Allow) — stop right away.
+                # 'offline'/missing can be a transient Wi-Fi/adb blip, so tolerate
+                # a few consecutive misses before giving up, and auto-recover if it
+                # comes back. This keeps a brief internet drop from killing monitors.
+                if st == "unauthorized":
+                    self._set_status(serial, "unauthorized")
+                    m["active"] = False
+                    self.log(f"⚠ {serial}: {_STATE_REASON['unauthorized']} — monitor stopped")
+                    return
+                offline += 1
+                self._set_status(serial, "reconnecting")
+                if offline >= OFFLINE_TOLERANCE:
+                    self._set_status(serial, "disconnected")
+                    m["active"] = False
+                    self.log(f"⚠ {serial}: {_STATE_REASON.get(st, 'offline')} — monitor stopped after {offline} tries")
+                    return
+                # a Wi-Fi device (ip:port) usually needs an explicit reconnect
+                # after a drop — try to re-establish it before the next check
+                if ":" in serial:
+                    adb("connect", serial, timeout=10)
+                self.log(f"… {serial}: not reachable ({offline}/{OFFLINE_TOLERANCE}) — retrying")
+                for _ in range(MONITOR_INTERVAL):
+                    if not m["active"]:
+                        break
+                    time.sleep(1)
+                continue
+            offline = 0                          # reachable again -> reset
             try:
                 last_ref = self.device_creds(serial).get("last_ref") or None
-                # Restart the app cleanly every 30 min (and on first poll) to drop
-                # any expired session / frozen WebView before reading.
-                fresh = (time.time() - last_fresh) >= FRESH_RESTART_INTERVAL
+                # Global per-device cycle counter: a fresh app restart happens at
+                # count 0 (first poll, and every FRESH_RESTART_CYCLES thereafter)
+                # to drop any expired session / frozen WebView before reading.
+                count = self._cycles.get(serial, 0)
+                fresh = (count == 0)
                 if fresh:
-                    last_fresh = time.time()
-                    self.log(f"↻ {serial}: fresh app restart (30-min cycle)")
-                self.log(f"⟳ {serial}: refreshing messages…")
+                    self.log(f"↻ {serial}: fresh app restart (cycle {count}/{FRESH_RESTART_CYCLES})")
+                self.log(f"⟳ {serial}: refreshing messages… (cycle {count}/{FRESH_RESTART_CYCLES})")
                 res = bcel.poll_messages(serial, last_ref, pwd, user, fresh=fresh,
                                          log=lambda msg: self.log(f"   {serial}: {msg}"))
                 new = res.get("new") or []
+                advance = True
                 if new:
-                    self._send(serial, new)
+                    advance = self._send(serial, new)
                 else:
                     self.log(f"· {serial}: no new transactions")
-                if res.get("last_ref"):
+                # Only move the watermark forward if the send actually succeeded
+                # (or there was nothing to send). On a transient failure we keep
+                # the old watermark so the same transactions are retried next cycle
+                # instead of being skipped and lost.
+                if res.get("last_ref") and advance:
                     self.set_last_ref(serial, res["last_ref"])
+                # advance the global cycle, wrapping back to 0 (fresh) every N cycles
+                self._cycles[serial] = (count + 1) % FRESH_RESTART_CYCLES
             except Exception as e:
-                if not device_online(serial):
-                    self._set_status(serial, "disconnected")
-                    m["active"] = False
-                    return
+                # Don't hard-stop on a single error (a Wi-Fi drop mid-poll throws):
+                # just log and let the tolerant top-of-loop check decide whether the
+                # device is really gone over the next few cycles.
                 self.log(f"✗ {serial}: {e}")
             for _ in range(MONITOR_INTERVAL):
                 if not m["active"]:
@@ -427,12 +510,39 @@ class Engine:
         threading.Thread(target=worker, daemon=True).start()
         return {"payload": payload, "qr_png": self._qr_png(payload)}
 
+    @staticmethod
+    def _dedup_key(t):
+        """Identity used to guard against double-posting. Real bank references
+        (bill_no / FQR…/FAC…) are globally unique, so they dedup across ALL
+        devices — this also stops two phones on the same account from both
+        forwarding the same transfer. The time-based fallback ref ("HH:MM:SS|type")
+        is NOT unique, so it's scoped per device + amount instead."""
+        ref = (t.get("ref") or t.get("bill_no") or "").strip()
+        if ref and "|" not in ref:
+            return ref
+        amt = t.get("amount_in") or t.get("amount") or ""
+        return f"{t.get('serial')}|{ref}|{amt}"
+
     def _send(self, serial, new):
         s = self.device_set(serial)
         cid = (s.get("client_id") or "").strip() if s else ""
         key = (s.get("api_key") or "").strip() if s else ""
         api_url = ((s.get("api_url") or "").strip() if s else "") or GATEWAY_API_URL
         txns = [{**t, "serial": serial} for t in new]
+        # GLOBAL duplicate guard: drop any transaction whose reference was already
+        # posted (by this device on an earlier cycle, after a fresh restart, or by
+        # another device sharing the same account).
+        with self._sent_lock:
+            kept = []
+            for t in txns:
+                k = self._dedup_key(t)
+                if k in self._sent_refs:
+                    self.log(f"⚠ {serial}: skipped duplicate transaction (ref {t.get('ref') or t.get('bill_no')})")
+                    continue
+                kept.append(t)
+            txns = kept
+        if not txns:
+            return True            # nothing new (or all already sent) -> safe to advance
         # Newer app builds insert a spurious brand element at raw[2] ("OneBank Kid"
         # or a duplicate "OneBank"), pushing the real "OneBank" to raw[3] and
         # shifting every later index — which breaks the gateway's fixed raw[]
@@ -445,16 +555,29 @@ class Engine:
                 while len(raw) > 3 and raw[3] == "OneBank":
                     del raw[2]
                 t["raw"] = raw
+        # Not configured -> DON'T advance the watermark: keep these transactions
+        # pending so they're sent once a valid set is assigned (no silent loss).
         if not s:
-            self.log(f"⚠ {serial}: no setting set assigned — not sent (assign one on the device card)")
-            return
+            self.log(f"⚠ {serial}: no setting set assigned — held (assign one on the device card)")
+            return False
         if not (cid and key):
-            self.log(f"⚠ {serial}: set '{s.get('name')}' is missing credentials — not sent")
-            return
+            self.log(f"⚠ {serial}: set '{s.get('name')}' is missing credentials — held")
+            return False
         try:
-            ok, msg = csl_client.post_transactions(api_url, cid, key, txns, timeout=10)
+            ok, msg, transient = csl_client.post_transactions(api_url, cid, key, txns, timeout=10)
             self.log(f"→ {serial}: synced {len(txns)} transaction(s): {msg}")
             if ok:
+                # remember these references so they can never be posted again
+                with self._sent_lock:
+                    for t in txns:
+                        self._sent_refs[self._dedup_key(t)] = True
+                    while len(self._sent_refs) > self._SENT_MAX:
+                        self._sent_refs.popitem(last=False)   # evict oldest
+                    tail = list(self._sent_refs.keys())[-self._SENT_PERSIST:]
+                # persist a tail to disk (outside _sent_lock to keep lock order)
+                with self._slock:
+                    self.settings["sent_refs"] = tail
+                    save_settings(self.settings)
                 for t in txns:
                     from_acct, from_name = source_account(t)
                     rec = {"serial": serial, "type": t.get("type", ""),
@@ -468,5 +591,13 @@ class Engine:
                            "time": t.get("time", ""), "synced_at": time.time()}
                     self.transactions.append(rec)
                     self.emit("transaction", rec)
+                return True
+            # gateway reachable but rejected the batch (4xx) -> advance so one bad
+            # record can't block everything; a transient/5xx/network error -> retry.
+            if transient:
+                self.log(f"↻ {serial}: gateway unreachable — will retry next cycle")
+                return False
+            return True
         except Exception as e:
-            self.log(f"⚠ {serial}: sync failed: {e}")
+            self.log(f"⚠ {serial}: sync failed: {e} — will retry next cycle")
+            return False

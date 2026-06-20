@@ -82,7 +82,9 @@ def setup_webhook(api_url: str, client_id: str, api_key: str, webhook: str,
 def post_transactions(api_url: str, client_id: str, api_key: str, transactions,
                       timeout: int = 15):
     """POST /bcel/transactions with the detected transaction payload(s).
-    Returns (ok: bool, message: str)."""
+    Returns (ok: bool, message: str, transient: bool) — transient=True means the
+    gateway couldn't be reached (network/timeout/5xx), so the caller should retry
+    rather than advance its watermark and drop the transactions."""
     body = {"transactions": transactions}
     sig = gen_hash(body, api_key)
     url = _url(api_url, "/bcel/transactions")
@@ -94,17 +96,18 @@ def post_transactions(api_url: str, client_id: str, api_key: str, transactions,
     try:
         r = requests.post(url, json=body, headers=headers, timeout=timeout)
     except requests.exceptions.RequestException as e:
-        return False, _request_error_message(e, api_url)
+        return False, _request_error_message(e, api_url), True   # couldn't reach -> retry
     try:
         data = r.json()
     except Exception:
         data = {"raw": r.text[:200]}
     ok = r.status_code == 200 and (data.get("status") is True)
     if ok:
-        return True, "Transactions posted (status: true)"
+        return True, "Transactions posted (status: true)", False
     code = data.get("code", r.status_code)
     msg = data.get("message", r.text[:120])
-    return False, f"transactions failed [{code}]: {msg}"
+    transient = r.status_code >= 500            # server error -> retry; 4xx -> reject
+    return False, f"transactions failed [{code}]: {msg}", transient
 
 
 if __name__ == "__main__":

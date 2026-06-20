@@ -30,8 +30,10 @@ $$(".nav").forEach((n) => n.addEventListener("click", () => showView(n.dataset.v
 // ---------- devices ----------
 let devices = [];
 function statusDot(s) {
-	// green = running, red = disconnected, gray = stopped/idle
-	const color = s === "monitoring" ? "#22c55e" : s === "disconnected" ? "#ef4444" : "#4a5365";
+	// green = running, red = disconnected, amber = unauthorized/reconnecting, gray = idle
+	const color = s === "monitoring" ? "#22c55e"
+		: s === "disconnected" ? "#ef4444"
+		: (s === "unauthorized" || s === "reconnecting") ? "#f59e0b" : "#4a5365";
 	const glow = s === "monitoring" ? "box-shadow:0 0 8px #22c55e;" : "";
 	return `<span class="sdot" style="background:${color};${glow}" title="${s}"></span>`;
 }
@@ -61,6 +63,9 @@ function renderDevices() {
       </div>
 	      <div class="meta">
 	        <span class="${d.has_creds ? "ok" : ""}">${d.has_creds ? "● credentials set" : "○ no credentials"}</span>
+	        ${d.state && d.state !== "device"
+				? `<span class="warn">⚠ ${d.state === "unauthorized" ? "unauthorized — tap Allow on the phone" : d.state}</span>`
+				: ""}
 	      </div>
 	      <div class="actions">
 	        ${running
@@ -307,16 +312,23 @@ function openModal(serial) {
 	$("#modal-serial").textContent = `${d.model || ""}  ·  ${serial}`;
 	$("#m-user").value = d.username || "";
 	$("#m-pass").value = "";
+	// the plaintext password is never sent to the UI (it'd leak over Sync); show
+	// whether one is saved and keep it unless a new value is typed.
+	$("#m-pass").placeholder = d.has_creds ? "•••••• (saved — blank keeps it)" : "device password";
 	$("#m-ref").value = d.last_ref || "";
 	$("#modal").classList.remove("hidden");
 }
 $("#m-cancel").onclick = () => $("#modal").classList.add("hidden");
 $("#m-save").onclick = async () => {
-	await post(`/api/devices/${encodeURIComponent(modalSerial)}/creds`, {
+	const body = {
 		username: $("#m-user").value.trim(),
-		password: $("#m-pass").value,
 		last_ref: $("#m-ref").value.trim(),
-	});
+	};
+	// only send the password if the user actually typed one, so saving other
+	// fields can't wipe the stored password
+	const pass = $("#m-pass").value;
+	if (pass) body.password = pass;
+	await post(`/api/devices/${encodeURIComponent(modalSerial)}/creds`, body);
 	$("#modal").classList.add("hidden");
 	loadDevices();
 };
