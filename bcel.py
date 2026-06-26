@@ -111,6 +111,40 @@ def clear_and_type(d, value, n=16):
     d.send_keys(str(value))
 
 
+def replace_focused_text(d, value, log=print, field_name="input", clear_chars=32):
+    raw_value = str(value or "")
+    try:
+        d.send_keys("", clear=True)
+    except Exception as e:
+        log(f"{field_name}: retry clear")
+        try:
+            d.shell("input keyevent 123 " + ("67 " * clear_chars))
+            time.sleep(0.15)
+        except Exception:
+            pass
+    d.send_keys(raw_value, clear=False)
+
+
+def type_into_security_answer(d, value, log=print, field_name="security answer", clear_chars=32):
+    raw_value = str(value or "")
+    try:
+        d.shell("input keyevent 123 " + ("67 " * clear_chars))
+        time.sleep(0.15)
+    except Exception:
+        pass
+    d.send_keys(raw_value, clear=False)
+
+
+def type_into_active_field(d, value, log=print, field_name="active input", clear_chars=32):
+    raw_value = str(value or "")
+    try:
+        d.shell("input keyevent 123 " + ("67 " * clear_chars))
+        time.sleep(0.15)
+    except Exception:
+        pass
+    d.send_keys(raw_value, clear=False)
+
+
 def fill(d, xy, value, passes=1):
     """Focus a custom input box, clear, then type. Pass passes=2 for the first
     field after a page load (its input can be swallowed while the IME attaches)."""
@@ -173,6 +207,1503 @@ def decode_qr(path):
     return data
 
 
+def _only_digits(value):
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _norm_text(value):
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def _center(bounds):
+    x1, y1, x2, y2 = bounds
+    return (x1 + x2) // 2, (y1 + y2) // 2
+
+
+def _masked_value_matches(saved_value, displayed_text, min_prefix=1, min_suffix=1):
+    saved = _only_digits(saved_value)
+    if not saved:
+        return False
+    shown = _norm_text(displayed_text)
+    prefix = []
+    i = 0
+    while i < len(shown):
+        ch = shown[i]
+        if ch == "x":
+            break
+        if ch.isdigit():
+            prefix.append(ch)
+        i += 1
+    suffix = []
+    j = len(shown) - 1
+    while j >= 0:
+        ch = shown[j]
+        if ch == "x":
+            break
+        if ch.isdigit():
+            suffix.append(ch)
+        j -= 1
+    prefix = "".join(prefix)
+    suffix = "".join(reversed(suffix))
+    if prefix and len(prefix) < min_prefix:
+        return False
+    if suffix and len(suffix) < min_suffix:
+        return False
+    if prefix and not saved.startswith(prefix):
+        return False
+    if suffix and not saved.endswith(suffix):
+        return False
+    if not prefix and not suffix:
+        shown_digits = _only_digits(displayed_text)
+        return bool(shown_digits) and shown_digits == saved
+    return True
+
+
+def _masked_visible_parts(displayed_text):
+    shown = _norm_text(displayed_text)
+    prefix = []
+    i = 0
+    while i < len(shown):
+        ch = shown[i]
+        if ch == "x":
+            break
+        if ch.isdigit():
+            prefix.append(ch)
+        i += 1
+    suffix = []
+    j = len(shown) - 1
+    while j >= 0:
+        ch = shown[j]
+        if ch == "x":
+            break
+        if ch.isdigit():
+            suffix.append(ch)
+        j -= 1
+    return "".join(prefix), "".join(reversed(suffix))
+
+
+def _masked_account_matches(saved_account, displayed_text):
+    saved = _only_digits(saved_account)
+    if len(saved) < 8:
+        return False
+    prefix, suffix = _masked_visible_parts(displayed_text)
+    if not prefix and not suffix:
+        return False
+    if prefix and not saved.startswith(prefix):
+        return False
+    if suffix and not saved.endswith(suffix):
+        return False
+    return True
+
+
+def _normalize_security_label(value):
+    return _norm_text(value)
+
+
+def _collect_hierarchy_nodes(d):
+    root = ET.fromstring(d.dump_hierarchy())
+    nodes = []
+    for el in root.iter():
+        bounds = _parse_bounds(el.attrib.get("bounds", ""))
+        text = (el.attrib.get("text") or "").strip()
+        hint = (el.attrib.get("hint") or "").strip()
+        desc = (el.attrib.get("content-desc") or "").strip()
+        rid = (el.attrib.get("resource-id") or "").strip()
+        clazz = (el.attrib.get("class") or "").strip()
+        combined = _norm_text(" ".join(part for part in (text, hint, desc, rid) if part))
+        nodes.append({
+            "bounds": bounds,
+            "text": text,
+            "hint": hint,
+            "desc": desc,
+            "rid": rid,
+            "class": clazz,
+            "combined": combined,
+        })
+    nodes.sort(key=lambda n: (n["bounds"][1] if n["bounds"] else 10**9,
+                              n["bounds"][0] if n["bounds"] else 10**9))
+    return nodes
+
+
+def _extract_center_modal_message(nodes):
+    texts = []
+    for node in nodes:
+        bounds = node.get("bounds")
+        text = (node.get("text") or "").strip()
+        rid = (node.get("rid") or "").split("/")[-1]
+        if not bounds or not text:
+            continue
+        x1, y1, x2, y2 = bounds
+        width = x2 - x1
+        height = y2 - y1
+        if width < 180:
+            continue
+        if y1 < 120 or y2 > 1280:
+            continue
+        if rid in {"titletext", "titleback", "next", "navigation"}:
+            continue
+        if text in {"ຕົກລົງ", "OK", "Close", "ປິດ", "Transfer", "ໂອນເງິນ"}:
+            continue
+        texts.append((y1, text))
+    if not texts:
+        return ""
+    lines = []
+    seen = set()
+    for _, text in sorted(texts, key=lambda item: item[0]):
+        if text in seen:
+            continue
+        seen.add(text)
+        lines.append(text)
+    return " ".join(lines[:4]).strip()
+
+
+def _find_text_node(nodes, labels, contains=False):
+    wanted = tuple(_norm_text(label) for label in labels if label)
+    for node in nodes:
+        text = (node.get("text") or "").strip()
+        if not text:
+            continue
+        current = _norm_text(text)
+        if contains:
+            if any(label in current for label in wanted):
+                return node
+        elif current in wanted:
+            return node
+    return None
+
+
+def _is_transfer_success_page(nodes):
+    success_title = _find_text_node(
+        nodes,
+        ("ໂອນເງິນສໍາເລັດ", "ໂອນເງິນສຳເລັດ", "transfer success", "successful transfer"),
+        contains=True,
+    )
+    done_button = _find_text_node(
+        nodes,
+        ("ສໍາເລັດ", "ສຳເລັດ", "ສໍາເລັດແລ້ວ", "ສຳເລັດແລ້ວ", "done"),
+        contains=True,
+    )
+    receipt_anchor = _find_text_node(
+        nodes,
+        ("ເລກ Ticket", "ticket", "ຈໍານວນເງິນ", "withdraw from merchant balance"),
+        contains=True,
+    )
+    return bool(done_button and (success_title or receipt_anchor))
+
+
+def _security_answer_field_specs(answer_value):
+    specs = []
+    for idx in (1, 2, 3):
+        label = str(idx)
+        if isinstance(answer_value, dict):
+            answer = str(answer_value.get(f"withdraw_a{idx}", "") or "").strip()
+        else:
+            answer = str(answer_value or "").strip() if idx == 1 else ""
+        specs.append({
+            "index": idx,
+            "answer": answer,
+            "labels": (
+                f"ຄໍາຕອບທີ {label}",
+                f"ຄໍາຕອບທີ{label}",
+                f"ຄຳຕອບທີ {label}",
+                f"ຄຳຕອບທີ{label}",
+                f"ຄໍາຖາມທີ {label}",
+                f"ຄໍາຖາມທີ{label}",
+                f"ຄຳຖາມທີ {label}",
+                f"ຄຳຖາມທີ{label}",
+                f"Question {label}",
+                f"question {label}",
+                f"Answer {label}",
+                f"answer {label}",
+            ),
+            "answer_field_ids": (
+                f"ans{label}",
+            ),
+            "page_ids": (
+                f"pageq{label}",
+            ),
+        })
+    return specs
+
+
+def _security_label_matches(node, label_norms):
+    if not node.get("combined"):
+        return False
+    combined = node["combined"]
+    text = _normalize_security_label(node.get("text", ""))
+    hint = _normalize_security_label(node.get("hint", ""))
+    desc = _normalize_security_label(node.get("desc", ""))
+    rid = _normalize_security_label(node.get("rid", ""))
+    if any(label in combined for label in label_norms):
+        return True
+    if any(label in text for label in label_norms):
+        return True
+    if any(label in hint for label in label_norms):
+        return True
+    if any(label in desc for label in label_norms):
+        return True
+    if any(label in rid for label in label_norms):
+        return True
+    return False
+
+
+def _security_page_title_matches(nodes):
+    title_tokens = (
+        "ຢັ້ງຢືນຕົວຕົນເພີ່ມເຕີມ",
+        "additional identity verification",
+        "identity verification",
+    )
+    title_norms = tuple(_norm_text(t) for t in title_tokens)
+    for node in nodes:
+        rid = (node.get("rid") or "").split("/")[-1]
+        if rid != "titletext":
+            continue
+        text = _norm_text(node.get("text", ""))
+        if any(tok in text for tok in title_norms):
+            return True
+    return False
+
+
+def _is_security_answer_page(nodes):
+    if _security_page_title_matches(nodes):
+        return True
+    for node in nodes:
+        rid = (node.get("rid") or "").split("/")[-1]
+        if rid in {"pageq1", "pageq2", "pageq3", "ans1", "ans2", "ans3"}:
+            return True
+    return False
+
+
+def _detect_security_question_index(nodes, specs):
+    for spec in specs:
+        for node in nodes:
+            rid = (node.get("rid") or "").split("/")[-1]
+            if rid in set(spec.get("answer_field_ids", ())):
+                return spec["index"]
+            if rid in set(spec.get("page_ids", ())):
+                return spec["index"]
+            if _security_label_matches(node, tuple(_norm_text(label) for label in spec["labels"])):
+                return spec["index"]
+    return None
+
+
+def _is_transfer_description_page(nodes):
+    title_tokens = (
+        "ຄໍາອະທິບາຍການໂອນ",
+        "ຄຳອະທິບາຍການໂອນ",
+        "transfer description",
+    )
+    field_tokens = (
+        "ປ້ອນຄໍາອະທິບາຍ",
+        "ປ້ອນຄຳອະທິບາຍ",
+        "input transfer description",
+        "description",
+    )
+    title_norms = tuple(_norm_text(t) for t in title_tokens)
+    field_norms = tuple(_norm_text(t) for t in field_tokens)
+    title_found = False
+    field_found = False
+    for node in nodes:
+        combined = node.get("combined", "")
+        rid = (node.get("rid") or "").split("/")[-1]
+        if combined and any(tok in combined for tok in title_norms):
+            title_found = True
+        if combined and any(tok in combined for tok in field_norms):
+            field_found = True
+        if rid in {"desc", "description", "transferdescription", "remark", "note"}:
+            field_found = True
+    return title_found or field_found
+
+
+def _account_match_details(saved_account, displayed_text):
+    saved = _only_digits(saved_account)
+    prefix, suffix = _masked_visible_parts(displayed_text)
+    return {
+        "screen": displayed_text,
+        "screen_prefix": prefix,
+        "screen_suffix": suffix,
+        "saved_prefix_ok": bool(prefix) and saved.startswith(prefix),
+        "saved_suffix_ok": bool(suffix) and saved.endswith(suffix),
+        "matched": _masked_account_matches(saved_account, displayed_text),
+    }
+
+
+def _masked_card_matches(saved_card_no, displayed_text):
+    saved = _only_digits(saved_card_no)
+    shown_digits = _only_digits(displayed_text)
+    if len(saved) < 10 or len(shown_digits) < 10:
+        return False
+    return _masked_value_matches(saved_card_no, displayed_text, min_prefix=8, min_suffix=2)
+
+
+def _suffix_matches(saved_card_no, displayed_text, min_visible=2):
+    saved = _only_digits(saved_card_no)
+    shown = _only_digits(displayed_text)
+    if len(saved) < min_visible or len(shown) < min_visible:
+        return False
+    max_len = min(4, len(shown), len(saved))
+    for size in range(max_len, min_visible - 1, -1):
+        if shown.endswith(saved[-size:]):
+            return True
+    return False
+
+
+def _canonical_name(value):
+    text = re.sub(r"\s+", " ", str(value or "").strip()).upper()
+    parts = [p for p in re.split(r"[\s/]+", text) if p]
+    honorifics = {"MR", "MRS", "MS", "MISS", "MISTER"}
+    parts = [p for p in parts if p.rstrip(".") not in honorifics]
+    return " ".join(parts)
+
+
+def _section_anchor(nodes, tokens):
+    norm_tokens = tuple(_norm_text(t) for t in tokens)
+    for node in nodes:
+        text = node.get("text", "")
+        if not text:
+            continue
+        normalized = _norm_text(text)
+        if any(tok in normalized for tok in norm_tokens):
+            return node
+    return None
+
+
+def _masked_account_below_anchor(nodes, anchor, saved_account, min_prefix=5, min_suffix=3):
+    if not anchor:
+        return None
+    ax1, ay1, ax2, ay2 = anchor["bounds"]
+    candidates = []
+    for node in nodes:
+        text = node.get("text", "")
+        bounds = node.get("bounds")
+        if not text or not bounds:
+            continue
+        x1, y1, x2, y2 = bounds
+        if y1 < ay1 - 40 or y1 > ay2 + 320:
+            continue
+        if x2 < ax1 - 80:
+            continue
+        if "x" not in _norm_text(text):
+            continue
+        if not _masked_account_matches(saved_account, text):
+            continue
+        candidates.append(node)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda n: n["bounds"][1])[0]
+
+
+def _name_near_account(nodes, account_node, expected_name):
+    wanted = _canonical_name(expected_name)
+    if not wanted or not account_node:
+        return None
+    nx1, ny1, nx2, ny2 = account_node["bounds"]
+    candidates = []
+    for node in nodes:
+        text = (node.get("text") or "").strip()
+        bounds = node.get("bounds")
+        if not text or not bounds:
+            continue
+        x1, y1, x2, y2 = bounds
+        if y2 < ny1 - 160 or y1 > ny2 + 60:
+            continue
+        if x2 < nx1 - 60:
+            continue
+        canonical = _canonical_name(text)
+        if not canonical:
+            continue
+        if wanted in canonical or canonical in wanted:
+            candidates.append(node)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda n: abs(n["bounds"][1] - ny1))[0]
+
+
+def verify_unionpay_card_detail(d, card_no, log=print, timeout=8):
+    saved = _only_digits(card_no)
+    if len(saved) < 10:
+        raise RuntimeError("saved withdraw card number is missing or too short")
+
+    deadline = time.time() + timeout
+    last_dump = ""
+    while time.time() < deadline:
+        try:
+            last_dump = d.dump_hierarchy()
+            root = ET.fromstring(last_dump)
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        texts = [(el.attrib.get("text") or "").strip() for el in root.iter()]
+        texts = [t for t in texts if t]
+        unionpay_seen = any("unionpay" in _norm_text(t) for t in texts)
+        prefix_seen = False
+        suffix_seen = False
+        matched_text = ""
+        for text in texts:
+            digits = _only_digits(text)
+            if len(digits) < 10:
+                continue
+            if digits[:8] == saved[:8]:
+                prefix_seen = True
+                if _suffix_matches(saved, digits):
+                    suffix_seen = True
+                    matched_text = text
+                    break
+        if unionpay_seen and prefix_seen and suffix_seen:
+            log(f"verified UnionPay detail card: saved={saved[:8]}...{saved[-4:]} screen={matched_text}")
+            return True
+        time.sleep(0.5)
+
+    raise RuntimeError(f"card detail verification failed for saved card ending {saved[-4:]}")
+
+
+def verify_transfer_money_page(d, log=print, timeout=8):
+    title_tokens = (
+        "ການໂອນເງິນ",
+        "transfer money",
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            root = ET.fromstring(d.dump_hierarchy())
+        except Exception:
+            time.sleep(0.5)
+            continue
+        texts = [(el.attrib.get("text") or "").strip() for el in root.iter()]
+        texts = [t for t in texts if t]
+        norm = [_norm_text(t) for t in texts]
+        if any(any(tok in t for tok in title_tokens) for t in norm):
+            log("verified transfer money page")
+            return True
+        time.sleep(0.5)
+    raise RuntimeError("transfer money page verification failed")
+
+
+def _is_transfer_money_page_from_dump(d):
+    try:
+        root = ET.fromstring(d.dump_hierarchy())
+    except Exception:
+        return False
+    texts = [(el.attrib.get("text") or "").strip() for el in root.iter()]
+    texts = [t for t in texts if t]
+    norm = [_norm_text(t) for t in texts]
+    return any("ການໂອນເງິນ" in t or "transfermoney" in t for t in norm)
+
+
+def select_source_account_on_transfer_page(d, account_no, log=print):
+    saved = _only_digits(account_no)
+    if len(saved) < 8:
+        raise RuntimeError("saved withdraw account number is missing or too short")
+
+    try:
+        root = ET.fromstring(d.dump_hierarchy())
+    except Exception as e:
+        raise RuntimeError(f"could not read transfer money page: {e}")
+
+    nodes = []
+    for el in root.iter():
+        text = (el.attrib.get("text") or "").strip()
+        bounds = _parse_bounds(el.attrib.get("bounds", ""))
+        if text and bounds:
+            nodes.append({"text": text, "bounds": bounds})
+
+    candidates = []
+    for node in nodes:
+        text = node["text"]
+        if not any(ch.isdigit() for ch in text):
+            continue
+        if "x" not in _norm_text(text):
+            continue
+        if _masked_account_matches(saved, text):
+            candidates.append(node)
+
+    if not candidates:
+        raise RuntimeError(f"transfer source account mismatch for saved account ending {saved[-4:]}")
+
+    number = sorted(candidates, key=lambda n: n["bounds"][1])[0]
+    nx1, ny1, nx2, ny2 = number["bounds"]
+    related = [number]
+    for node in nodes:
+        text = node["text"]
+        if not text:
+            continue
+        x1, y1, x2, y2 = node["bounds"]
+        if y1 < ny1 - 140 or y2 > ny2 + 160:
+            continue
+        if x2 < nx1 - 220 or x1 > nx2 + 260:
+            continue
+        related.append(node)
+    row_bounds = (
+        min(n["bounds"][0] for n in related),
+        min(n["bounds"][1] for n in related),
+        max(n["bounds"][2] for n in related),
+        max(n["bounds"][3] for n in related),
+    )
+    cx, cy = _center(row_bounds)
+    screen_prefix, screen_suffix = _masked_visible_parts(number["text"])
+    log(
+        f"matched transfer source account: "
+        f"screen_prefix={screen_prefix or '-'} screen_suffix={screen_suffix or '-'} "
+        f"saved_prefix_match={'yes' if saved.startswith(screen_prefix) else 'no'} "
+        f"saved_suffix_match={'yes' if saved.endswith(screen_suffix) else 'no'} "
+        f"screen={number['text']}"
+    )
+    d.click(cx, cy)
+    time.sleep(1)
+    return True
+
+
+def verify_receiver_account_page(d, log=print, timeout=8):
+    title_tokens = (
+        "ບັນຊີປາຍທາງ",
+        "receivers account",
+        "receiver account",
+    )
+    add_tokens = (
+        "ເພີ່ມບັນຊີປາຍທາງ",
+        "add receivers account",
+        "receivers account",
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            root = ET.fromstring(d.dump_hierarchy())
+        except Exception:
+            time.sleep(0.5)
+            continue
+        texts = [(el.attrib.get("text") or "").strip() for el in root.iter()]
+        norm = [_norm_text(t) for t in texts if t]
+        title_ok = any(any(tok in t for tok in title_tokens) for t in norm)
+        add_ok = any(any(tok in t for tok in add_tokens) for t in norm)
+        if title_ok and add_ok:
+            log("verified receiver account page")
+            return True
+        time.sleep(0.5)
+    raise RuntimeError("receiver account page verification failed")
+
+
+def input_receiver_account(d, to_account, log=print, timeout=8):
+    raw_value = str(to_account or "").strip()
+    if len(raw_value) < 6:
+        raise RuntimeError("toAccount from request is missing or too short")
+
+    candidates = (
+        "ເລກບັນຊີ / ເລກບັດ / ເບີໂທ",
+        "Account / Card / Phone",
+        "account / card / phone",
+        "account number / card number / phone",
+        "receivers account",
+        "receiver account",
+        "account number",
+        "card number",
+        "phone number",
+    )
+    candidate_norms = tuple(_norm_text(label) for label in candidates)
+    last_seen = []
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for label in candidates:
+            try:
+                el = d(text=label)
+                if el.exists:
+                    el.click()
+                    time.sleep(0.4)
+                    replace_focused_text(d, raw_value, log=log, field_name="receiver account")
+                    log(f"entered receiver account from request: ...{raw_value[-4:]}")
+                    return True
+            except Exception:
+                pass
+            try:
+                xp = d.xpath(f'//*[@text="{label}" or @hint="{label}"]')
+                if xp.exists:
+                    xp.click()
+                    time.sleep(0.4)
+                    replace_focused_text(d, raw_value, log=log, field_name="receiver account")
+                    log(f"entered receiver account from request: ...{raw_value[-4:]}")
+                    return True
+            except Exception:
+                pass
+        try:
+            root = ET.fromstring(d.dump_hierarchy())
+            nodes = []
+            for el in root.iter():
+                bounds = _parse_bounds(el.attrib.get("bounds", ""))
+                if not bounds:
+                    continue
+                text = (el.attrib.get("text") or "").strip()
+                hint = (el.attrib.get("hint") or "").strip()
+                desc = (el.attrib.get("content-desc") or "").strip()
+                rid = (el.attrib.get("resource-id") or "").strip()
+                clazz = (el.attrib.get("class") or "").strip()
+                combined = _norm_text(" ".join(part for part in (text, hint, desc, rid) if part))
+                if combined:
+                    last_seen.append(combined[:80])
+                    last_seen = last_seen[-6:]
+                nodes.append({
+                    "bounds": bounds,
+                    "text": text,
+                    "hint": hint,
+                    "desc": desc,
+                    "rid": rid,
+                    "class": clazz,
+                    "combined": combined,
+                })
+
+            for node in nodes:
+                combined = node["combined"]
+                if not combined:
+                    continue
+                if not any(label in combined for label in candidate_norms):
+                    continue
+                cx, cy = _center(node["bounds"])
+                log(f"focusing receiver account field: {node['text'] or node['hint'] or node['desc'] or node['rid']}")
+                d.click(cx, cy)
+                time.sleep(0.4)
+                replace_focused_text(d, raw_value, log=log, field_name="receiver account")
+                log(f"entered receiver account from request: ...{raw_value[-4:]}")
+                return True
+
+            for node in nodes:
+                combined = node["combined"]
+                clazz = _norm_text(node["class"])
+                if not combined:
+                    continue
+                english_like = "account" in combined and "card" in combined and "phone" in combined
+                lao_like = "ເລກບັນຊີ" in combined and "ເລກບັດ" in combined and "ເບີໂທ" in combined
+                input_like = "edittext" in clazz or "textfield" in clazz or "input" in combined
+                if not ((english_like or lao_like) and input_like):
+                    continue
+                cx, cy = _center(node["bounds"])
+                log(f"focusing receiver account input by hierarchy: {node['text'] or node['hint'] or node['desc'] or node['rid']}")
+                d.click(cx, cy)
+                time.sleep(0.4)
+                replace_focused_text(d, raw_value, log=log, field_name="receiver account")
+                log(f"entered receiver account from request: ...{raw_value[-4:]}")
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    seen = ", ".join(last_seen[-3:]) if last_seen else "no visible input labels"
+    raise RuntimeError(f"receiver account input not found (seen: {seen})")
+
+
+def click_receiver_next(d, log=print, timeout=8):
+    labels = (
+        "ຕໍ່ໄປ",
+        "Next",
+        "ເພີ່ມບັນຊີ",
+        "Add Account",
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for label in labels:
+            try:
+                el = d(text=label)
+                if el.exists:
+                    info = el.info
+                    bounds = info.get("bounds") or {}
+                    if bounds:
+                        cx = int((bounds.get("left", 0) + bounds.get("right", 0)) / 2)
+                        cy = int((bounds.get("top", 0) + bounds.get("bottom", 0)) / 2)
+                        log(f"clicking receiver next: {label}")
+                        d.click(cx, cy)
+                        time.sleep(1)
+                        return True
+                    el.click()
+                    log(f"clicking receiver next: {label}")
+                    time.sleep(1)
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.5)
+    raise RuntimeError("receiver next button not found (tried: ຕໍ່ໄປ, Next, ເພີ່ມບັນຊີ, Add Account)")
+
+
+def verify_transfer_amount_page(d, from_account, to_account, to_name, log=print, timeout=8):
+    from_saved = _only_digits(from_account)
+    to_saved = _only_digits(to_account)
+    if len(from_saved) < 8:
+        raise RuntimeError("saved withdraw source account is missing or too short")
+    if len(to_saved) < 8:
+        raise RuntimeError("request toAccount is missing or too short")
+
+    from_tokens = ("ຈາກບັນຊີ", "from account", "form account")
+    to_tokens = ("ຫາບັນຊີ", "to account")
+    last_state = {}
+    failure_reason = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            root = ET.fromstring(d.dump_hierarchy())
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        nodes = []
+        texts = []
+        for el in root.iter():
+            text = (el.attrib.get("text") or "").strip()
+            bounds = _parse_bounds(el.attrib.get("bounds", ""))
+            if text:
+                texts.append(text)
+            if text and bounds:
+                nodes.append({"text": text, "bounds": bounds})
+
+        from_anchor = _section_anchor(nodes, from_tokens)
+        to_anchor = _section_anchor(nodes, to_tokens)
+        from_node = _masked_account_below_anchor(nodes, from_anchor, from_saved, min_prefix=5, min_suffix=3)
+        to_node = _masked_account_below_anchor(nodes, to_anchor, to_saved, min_prefix=5, min_suffix=3)
+        name_node = _name_near_account(nodes, to_node, to_name) if to_node else None
+
+        state = {
+            "title_seen": texts[:8],
+            "from_anchor": from_anchor["text"] if from_anchor else "",
+            "from_match": from_node["text"] if from_node else "",
+            "from_screen_prefix": _masked_visible_parts(from_node["text"])[0] if from_node else "",
+            "from_screen_suffix": _masked_visible_parts(from_node["text"])[1] if from_node else "",
+            "to_anchor": to_anchor["text"] if to_anchor else "",
+            "to_match": to_node["text"] if to_node else "",
+            "to_screen_prefix": _masked_visible_parts(to_node["text"])[0] if to_node else "",
+            "to_screen_suffix": _masked_visible_parts(to_node["text"])[1] if to_node else "",
+            "name_match": name_node["text"] if name_node else "",
+            "name_expected": _canonical_name(to_name),
+        }
+        last_state = state
+
+        if not from_node or not to_node:
+            if not from_anchor:
+                failure_reason = "from account section label not found"
+            elif not from_node:
+                failure_reason = "from account masked value did not match saved account"
+            elif not to_anchor:
+                failure_reason = "to account section label not found"
+            else:
+                failure_reason = "to account masked value did not match request account"
+            time.sleep(0.5)
+            continue
+
+        if not name_node:
+            expected = _canonical_name(to_name)
+            screen = to_node["text"] if to_node else "-"
+            raise RuntimeError(
+                f"transfer amount page receiver name mismatch for {expected or '-'} "
+                f"(to_account_screen={screen})"
+            )
+
+        log(
+            f"verified transfer amount page: "
+            f"from={from_node['text']} to={to_node['text']} name={name_node['text']}"
+        )
+        return True
+
+    detail = (
+        f"reason={failure_reason or '-'} "
+        f"from_anchor={last_state.get('from_anchor') or '-'} "
+        f"from_match={last_state.get('from_match') or '-'} "
+        f"to_anchor={last_state.get('to_anchor') or '-'} "
+        f"to_match={last_state.get('to_match') or '-'} "
+        f"name_match={last_state.get('name_match') or '-'} "
+        f"name_expect={last_state.get('name_expected') or '-'}"
+    )
+    raise RuntimeError(f"transfer amount page verification failed ({detail})")
+
+
+def verify_transfer_confirmation_page(d, from_account, to_account, to_name, log=print, timeout=8):
+    from_saved = _only_digits(from_account)
+    to_saved = _only_digits(to_account)
+    if len(from_saved) < 8:
+        raise RuntimeError("saved withdraw source account is missing or too short")
+    if len(to_saved) < 8:
+        raise RuntimeError("request toAccount is missing or too short")
+
+    from_tokens = ("ຈາກບັນຊີ", "from account", "form account")
+    to_tokens = ("ຫາບັນຊີ", "to account")
+    last_state = {}
+    failure_reason = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            root = ET.fromstring(d.dump_hierarchy())
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        nodes = []
+        texts = []
+        for el in root.iter():
+            text = (el.attrib.get("text") or "").strip()
+            bounds = _parse_bounds(el.attrib.get("bounds", ""))
+            if text:
+                texts.append(text)
+            if text and bounds:
+                nodes.append({"text": text, "bounds": bounds})
+
+        from_anchor = _section_anchor(nodes, from_tokens)
+        to_anchor = _section_anchor(nodes, to_tokens)
+        from_node = _masked_account_below_anchor(nodes, from_anchor, from_saved, min_prefix=5, min_suffix=3)
+        to_node = _masked_account_below_anchor(nodes, to_anchor, to_saved, min_prefix=5, min_suffix=3)
+        name_node = _name_near_account(nodes, to_node, to_name) if to_node else None
+
+        state = {
+            "title_seen": texts[:8],
+            "from_anchor": from_anchor["text"] if from_anchor else "",
+            "from_match": from_node["text"] if from_node else "",
+            "to_anchor": to_anchor["text"] if to_anchor else "",
+            "to_match": to_node["text"] if to_node else "",
+            "name_match": name_node["text"] if name_node else "",
+            "name_expected": _canonical_name(to_name),
+        }
+        last_state = state
+
+        if not from_node or not to_node:
+            if not from_anchor:
+                failure_reason = "from account section label not found"
+            elif not from_node:
+                failure_reason = "from account masked value did not match saved account"
+            elif not to_anchor:
+                failure_reason = "to account section label not found"
+            else:
+                failure_reason = "to account masked value did not match request account"
+            time.sleep(0.5)
+            continue
+
+        if not name_node:
+            expected = _canonical_name(to_name)
+            screen = to_node["text"] if to_node else "-"
+            raise RuntimeError(
+                f"transfer confirmation receiver name mismatch for {expected or '-'} "
+                f"(to_account_screen={screen})"
+            )
+
+        log("confirm page verified")
+        return True
+
+    detail = (
+        f"reason={failure_reason or '-'} "
+        f"from_anchor={last_state.get('from_anchor') or '-'} "
+        f"from_match={last_state.get('from_match') or '-'} "
+        f"to_anchor={last_state.get('to_anchor') or '-'} "
+        f"to_match={last_state.get('to_match') or '-'} "
+        f"name_match={last_state.get('name_match') or '-'} "
+        f"name_expect={last_state.get('name_expected') or '-'}"
+    )
+    raise RuntimeError(f"transfer confirmation page verification failed ({detail})")
+
+
+def click_transfer_confirm(d, log=print, timeout=8):
+    labels = ("ໂອນເງິນ", "Transfer")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for label in labels:
+            try:
+                el = d(text=label)
+                if el.exists:
+                    info = el.info
+                    bounds = info.get("bounds") or {}
+                    if bounds:
+                        cx = int((bounds.get("left", 0) + bounds.get("right", 0)) / 2)
+                        cy = int((bounds.get("top", 0) + bounds.get("bottom", 0)) / 2)
+                        log(f"click transfer: {label}")
+                        d.click(cx, cy)
+                        time.sleep(1)
+                        return True
+                    el.click()
+                    log(f"click transfer: {label}")
+                    time.sleep(1)
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.5)
+    raise RuntimeError("transfer confirm button not found")
+
+
+def check_transfer_result_modal(d, log=print, timeout=6):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            nodes = _collect_hierarchy_nodes(d)
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        if _is_transfer_success_page(nodes):
+            done_node = _find_text_node(
+                nodes,
+                ("ສໍາເລັດ", "ສຳເລັດ", "ສໍາເລັດແລ້ວ", "ສຳເລັດແລ້ວ", "Done"),
+                contains=True,
+            )
+            bounds = done_node.get("bounds") if done_node else None
+            if bounds:
+                log("transfer success")
+                d.click(*_center(bounds))
+                time.sleep(1.2)
+                if go_home(d, log=log):
+                    log("current page: home")
+                    return True
+                log("current page: not home")
+                return True
+
+        message = _extract_center_modal_message(nodes)
+        button_found = False
+        for node in nodes:
+            text = (node.get("text") or "").strip()
+            if text in {"ຕົກລົງ", "OK", "Close", "ປິດ"}:
+                button_found = True
+                break
+
+        if message and button_found:
+            log(f"transfer failed: {message}")
+            raise RuntimeError(f"transfer failed: {message}")
+
+        time.sleep(0.5)
+    return False
+
+
+def recover_to_bcel_home(d, log=print, tries=3):
+    for _ in range(tries):
+        try:
+            nodes = _collect_hierarchy_nodes(d)
+        except Exception:
+            nodes = []
+
+        clicked = False
+        for node in nodes:
+            text = (node.get("text") or "").strip()
+            bounds = node.get("bounds")
+            if text not in {"ຕົກລົງ", "OK", "Close", "ປິດ"} or not bounds:
+                continue
+            log(f"close popup: {text}")
+            d.click(*_center(bounds))
+            time.sleep(0.8)
+            clicked = True
+            break
+
+        if clicked:
+            continue
+
+        if by_pass_popup_network_failure(d):
+            log("close popup")
+            continue
+
+        break
+
+    ok = go_home(d, log=log)
+    if ok:
+        log("back to home")
+    else:
+        log("back to home failed")
+    return ok
+
+
+def input_transfer_amount(d, amount, log=print, timeout=8):
+    raw_value = str(amount if amount is not None else "").strip()
+    if not raw_value:
+        raise RuntimeError("withdraw amount is missing")
+
+    candidates = (
+        "ຈໍານວນເງິນທີ່ໂອນ",
+        "Transfer amount",
+        "transfer amount",
+    )
+    label_candidates = (
+        "ກະລຸນາປ້ອນຈໍານວນ",
+        "Please enter amount",
+        "please enter amount",
+        "ຈໍານວນເງິນທີ່ໂອນ",
+        "Transfer amount",
+        "transfer amount",
+    )
+    candidate_norms = tuple(_norm_text(label) for label in candidates)
+    label_norms = tuple(_norm_text(label) for label in label_candidates)
+    last_seen = []
+    deadline = time.time() + timeout
+    direct_attempted = False
+    while time.time() < deadline:
+        if not direct_attempted:
+            direct_attempted = True
+            try:
+                time.sleep(0.3)
+                replace_focused_text(d, raw_value, log=log, field_name="transfer amount")
+                log(f"entered transfer amount: {raw_value}")
+                return True
+            except Exception:
+                pass
+        for label in candidates:
+            try:
+                xp = d.xpath(f'//*[@text="{label}" or @hint="{label}"]')
+                if xp.exists:
+                    xp.click()
+                    time.sleep(0.4)
+                    replace_focused_text(d, raw_value, log=log, field_name="transfer amount")
+                    log(f"entered transfer amount: {raw_value}")
+                    return True
+            except Exception:
+                pass
+            try:
+                el = d(text=label)
+                if el.exists:
+                    el.click()
+                    time.sleep(0.4)
+                    replace_focused_text(d, raw_value, log=log, field_name="transfer amount")
+                    log(f"entered transfer amount: {raw_value}")
+                    return True
+            except Exception:
+                pass
+        try:
+            root = ET.fromstring(d.dump_hierarchy())
+            nodes = []
+            for el in root.iter():
+                bounds = _parse_bounds(el.attrib.get("bounds", ""))
+                if not bounds:
+                    continue
+                text = (el.attrib.get("text") or "").strip()
+                hint = (el.attrib.get("hint") or "").strip()
+                desc = (el.attrib.get("content-desc") or "").strip()
+                rid = (el.attrib.get("resource-id") or "").strip()
+                clazz = (el.attrib.get("class") or "").strip()
+                combined = _norm_text(" ".join(part for part in (text, hint, desc, rid) if part))
+                if combined:
+                    last_seen.append(combined[:80])
+                    last_seen = last_seen[-8:]
+                node = {
+                    "bounds": bounds,
+                    "text": text,
+                    "hint": hint,
+                    "desc": desc,
+                    "rid": rid,
+                    "class": clazz,
+                    "combined": combined,
+                }
+                nodes.append(node)
+                if not any(label in combined for label in candidate_norms):
+                    continue
+                cx, cy = _center(bounds)
+                log(f"focusing transfer amount field: {text or hint or desc or rid or clazz}")
+                d.click(cx, cy)
+                time.sleep(0.4)
+                replace_focused_text(d, raw_value, log=log, field_name="transfer amount")
+                log(f"entered transfer amount: {raw_value}")
+                return True
+
+            for node in nodes:
+                combined = node["combined"]
+                if not combined:
+                    continue
+                if not any(label in combined for label in label_norms):
+                    continue
+                lx1, ly1, lx2, ly2 = node["bounds"]
+                field_candidates = []
+                for target in nodes:
+                    tx1, ty1, tx2, ty2 = target["bounds"]
+                    t_combined = target["combined"]
+                    t_class = _norm_text(target["class"])
+                    width = tx2 - tx1
+                    height = ty2 - ty1
+                    if ty1 < ly2 - 10 or ty1 > ly2 + 260:
+                        continue
+                    if tx1 > lx2 + 120 or tx2 < lx1 - 120:
+                        continue
+                    input_like = (
+                        "edittext" in t_class or
+                        "textfield" in t_class or
+                        "input" in t_combined or
+                        width > 500
+                    )
+                    if not input_like:
+                        continue
+                    if height < 60 or height > 240:
+                        continue
+                    field_candidates.append(target)
+                if field_candidates:
+                    best = sorted(
+                        field_candidates,
+                        key=lambda t: (t["bounds"][1], -(t["bounds"][2] - t["bounds"][0]))
+                    )[0]
+                    cx, cy = _center(best["bounds"])
+                    log(
+                        "focusing transfer amount field below label: "
+                        f"label={node['text'] or node['hint'] or node['desc'] or node['rid']} "
+                        f"target={best['text'] or best['hint'] or best['desc'] or best['rid'] or best['class']}"
+                    )
+                    d.click(cx, cy)
+                    time.sleep(0.4)
+                    replace_focused_text(d, raw_value, log=log, field_name="transfer amount")
+                    log(f"entered transfer amount: {raw_value}")
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    seen = ", ".join(last_seen[-4:]) if last_seen else "no visible amount labels"
+    raise RuntimeError(f"transfer amount input not found (seen: {seen})")
+
+
+def input_security_answer(d, answer, log=print, timeout=8):
+    field_specs = _security_answer_field_specs(answer)
+    active_specs = [spec for spec in field_specs if spec["answer"]]
+    if not active_specs:
+        raise RuntimeError("security answer 1 is missing in device credentials")
+
+    candidate_norms = tuple(_norm_text(label) for spec in active_specs for label in spec["labels"])
+    last_seen = []
+    filled_indexes = set()
+    flow_deadline = time.time() + max(timeout, 8) * 4
+
+    while time.time() < flow_deadline:
+        try:
+            nodes = _collect_hierarchy_nodes(d)
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        if not nodes:
+            time.sleep(0.5)
+            continue
+
+        for node in nodes:
+            combined = node.get("combined", "")
+            if combined:
+                last_seen.append(combined[:80])
+                last_seen = last_seen[-12:]
+
+        if not _is_security_answer_page(nodes):
+            if filled_indexes:
+                log("security answers done")
+                return True
+            return False
+
+        current_index = _detect_security_question_index(nodes, active_specs)
+        if current_index is None:
+            time.sleep(0.5)
+            continue
+
+        spec = next((item for item in active_specs if item["index"] == current_index), None)
+        if not spec:
+            raise RuntimeError(f"security answer {current_index} is required but missing in device credentials")
+        answer_value = spec["answer"]
+        spec_norms = tuple(_norm_text(label) for label in spec["labels"])
+        spec_nodes = [node for node in nodes if _security_label_matches(node, spec_norms)]
+        if spec_nodes:
+            chosen_label = spec_nodes[0]
+            label_text = chosen_label.get("text") or chosen_label.get("hint") or chosen_label.get("desc") or chosen_label.get("rid") or "-"
+        else:
+            chosen_label = None
+            label_text = f"answer {spec['index']}"
+
+        log(f"security question {current_index}")
+
+        try:
+            type_into_security_answer(d, answer_value, log=log, field_name=f"security answer {current_index}")
+            log(f"answer {current_index} entered")
+            click_receiver_next(d, log=log)
+            step_deadline = time.time() + timeout
+            while time.time() < step_deadline:
+                try:
+                    next_nodes = _collect_hierarchy_nodes(d)
+                except Exception:
+                    time.sleep(0.5)
+                    continue
+                next_index = _detect_security_question_index(next_nodes, active_specs)
+                if not _is_security_answer_page(next_nodes):
+                    log("security answers done")
+                    return True
+                if next_index != current_index:
+                    filled_indexes.add(current_index)
+                    break
+                time.sleep(0.5)
+            if current_index in filled_indexes:
+                continue
+            log(f"security question {current_index}: retry input")
+        except Exception as e:
+            log(f"security question {current_index}: retry input")
+
+        field_candidates = []
+        spec_field_ids = set(spec.get("answer_field_ids", ()))
+        for target in nodes:
+            target_rid = (target.get("rid") or "").split("/")[-1]
+            if target_rid in spec_field_ids:
+                field_candidates.append(target)
+        if chosen_label and chosen_label.get("bounds"):
+            lx1, ly1, lx2, ly2 = chosen_label["bounds"]
+            for target in nodes:
+                if target is chosen_label or not target.get("bounds"):
+                    continue
+                tx1, ty1, tx2, ty2 = target["bounds"]
+                width = tx2 - tx1
+                height = ty2 - ty1
+                if ty1 < ly2 - 10 or ty1 > ly2 + 260:
+                    continue
+                if tx1 > lx2 + 140 or tx2 < lx1 - 140:
+                    continue
+                tclass = _normalize_security_label(target.get("class", ""))
+                tcombined = target.get("combined", "")
+                input_like = (
+                    "edittext" in tclass or
+                    "textfield" in tclass or
+                    "input" in tcombined or
+                    width > 250
+                )
+                if not input_like:
+                    continue
+                if height < 50 or height > 260:
+                    continue
+                field_candidates.append(target)
+
+        if not field_candidates:
+            seen = ", ".join(last_seen[-4:]) if last_seen else "no visible security question labels"
+            raise RuntimeError(f"security answer {current_index} input not found (seen: {seen})")
+
+        best = sorted(
+            field_candidates,
+            key=lambda t: (
+                0 if (t.get("rid") or "").split("/")[-1] in spec_field_ids else 1,
+                t["bounds"][1] if t.get("bounds") else 10**9,
+                -((t["bounds"][2] - t["bounds"][0]) if t.get("bounds") else 0),
+            )
+        )[0]
+        cx, cy = _center(best["bounds"])
+        d.click(cx, cy)
+        time.sleep(0.8)
+        type_into_security_answer(d, answer_value, log=log, field_name=f"security answer {current_index}")
+        filled_indexes.add(current_index)
+        log(f"answer {current_index} entered")
+        click_receiver_next(d, log=log)
+
+        step_deadline = time.time() + timeout
+        while time.time() < step_deadline:
+            try:
+                next_nodes = _collect_hierarchy_nodes(d)
+            except Exception:
+                time.sleep(0.5)
+                continue
+            next_index = _detect_security_question_index(next_nodes, active_specs)
+            if not _is_security_answer_page(next_nodes):
+                log("security answers done")
+                return True
+            if next_index != current_index:
+                break
+            time.sleep(0.5)
+
+    seen = ", ".join(last_seen[-4:]) if last_seen else "no visible security question labels"
+    raise RuntimeError(f"security answer flow did not finish (seen: {seen})")
+
+
+def input_transfer_description(d, remark, log=print, timeout=8):
+    raw_value = str(remark or "").strip()
+    if not raw_value:
+        return False
+
+    deadline = time.time() + timeout
+    last_seen = []
+    while time.time() < deadline:
+        try:
+            nodes = _collect_hierarchy_nodes(d)
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        if not nodes:
+            time.sleep(0.5)
+            continue
+
+        if not _is_transfer_description_page(nodes):
+            return False
+
+        log("transfer description")
+
+        # On this screen the cursor is often already active in the top input box.
+        # Try typing into the active field first before doing any element hunting.
+        try:
+            type_into_active_field(d, raw_value, log=log, field_name="transfer description")
+            log("description entered")
+            click_receiver_next(d, log=log)
+            return True
+        except Exception:
+            log("transfer description: retry input")
+
+        label_norms = tuple(_norm_text(t) for t in (
+            "ຄໍາອະທິບາຍການໂອນ",
+            "ຄຳອະທິບາຍການໂອນ",
+            "transfer description",
+            "ປ້ອນຄໍາອະທິບາຍ",
+            "ປ້ອນຄຳອະທິບາຍ",
+        ))
+
+        anchor = None
+        for node in nodes:
+            combined = node.get("combined", "")
+            if combined:
+                last_seen.append(combined[:80])
+                last_seen = last_seen[-10:]
+            if anchor is None and combined and any(tok in combined for tok in label_norms):
+                anchor = node
+
+        field_candidates = []
+        for node in nodes:
+            rid = (node.get("rid") or "").split("/")[-1]
+            clazz = _norm_text(node.get("class", ""))
+            combined = node.get("combined", "")
+            bounds = node.get("bounds")
+            if not bounds:
+                continue
+            x1, y1, x2, y2 = bounds
+            width = x2 - x1
+            height = y2 - y1
+            input_like = (
+                rid in {"desc", "description", "transferdescription", "remark", "note"} or
+                "edittext" in clazz or
+                "textfield" in clazz or
+                "input" in combined or
+                width > 420
+            )
+            if not input_like:
+                continue
+            if width < 300 or height < 50 or height > 320:
+                continue
+            if anchor and anchor.get("bounds"):
+                ax1, ay1, ax2, ay2 = anchor["bounds"]
+                if y1 < ay1 - 40 or y1 > ay2 + 320:
+                    continue
+            field_candidates.append(node)
+
+        if not field_candidates:
+            seen = ", ".join(last_seen[-4:]) if last_seen else "no visible description labels"
+            raise RuntimeError(f"transfer description input not found (seen: {seen})")
+
+        best = sorted(
+            field_candidates,
+            key=lambda t: (
+                0 if (t.get("rid") or "").split("/")[-1] in {"desc", "description", "transferdescription", "remark", "note"} else 1,
+                t["bounds"][1],
+                -(t["bounds"][2] - t["bounds"][0]),
+            )
+        )[0]
+        cx, cy = _center(best["bounds"])
+        d.click(cx, cy)
+        time.sleep(0.8)
+        type_into_active_field(d, raw_value, log=log, field_name="transfer description")
+        log("description entered")
+        click_receiver_next(d, log=log)
+        return True
+
+    seen = ", ".join(last_seen[-4:]) if last_seen else "no visible description labels"
+    raise RuntimeError(f"transfer description flow did not finish (seen: {seen})")
+
+
+def click_transfer_on_unionpay_detail(d, log=print, timeout=8):
+    targets = ("ໂອນເງິນ", "Transfer")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            nodes = _collect_hierarchy_nodes(d)
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        candidates = []
+        for node in nodes:
+            text = (node.get("text") or "").strip()
+            bounds = node.get("bounds")
+            if text not in targets or not bounds:
+                continue
+            x1, y1, x2, y2 = bounds
+            width = x2 - x1
+            height = y2 - y1
+            if width < 40 or height < 20:
+                continue
+            candidates.append(node)
+
+        if not candidates:
+            time.sleep(0.5)
+            continue
+
+        candidates.sort(key=lambda n: (n["bounds"][1], n["bounds"][0]))
+        target_node = candidates[-1]
+        tx1, ty1, tx2, ty2 = target_node["bounds"]
+        cx = int((tx1 + tx2) / 2)
+        cy = int((ty1 + ty2) / 2)
+        text_h = max(ty2 - ty1, 1)
+
+        for tap_y, label in (
+            (cy, "clicking transfer text"),
+            (max(ty1 - int(text_h * 1.2), 0), "clicking slightly above transfer text"),
+        ):
+            log(f"{label}: {target_node['text']}")
+            d.click(cx, tap_y)
+            time.sleep(1.0)
+            if _is_transfer_money_page_from_dump(d):
+                return True
+
+        time.sleep(0.5)
+
+    raise RuntimeError("transfer menu 'ໂອນເງິນ' / 'Transfer' not found on UnionPay detail page")
+
+
+def select_unionpay_card(d, card_no, log=print):
+    saved = _only_digits(card_no)
+    if len(saved) < 10:
+        log("withdraw card select skipped — no saved card number")
+        return False
+
+    go_home(d, log=log)
+    if d(text="ບັດ").exists:
+        d(text="ບັດ").click()
+        time.sleep(1)
+
+    try:
+        root = ET.fromstring(d.dump_hierarchy())
+    except Exception as e:
+        raise RuntimeError(f"could not read card list: {e}")
+
+    nodes = []
+    for el in root.iter():
+        text = (el.attrib.get("text") or "").strip()
+        bounds = _parse_bounds(el.attrib.get("bounds", ""))
+        if text and bounds:
+            nodes.append({"text": text, "bounds": bounds})
+
+    titles = [n for n in nodes if "unionpay" in _norm_text(n["text"])]
+    if not titles:
+        raise RuntimeError("UnionPay card row not found on screen")
+
+    for title in titles:
+        tx1, ty1, tx2, ty2 = title["bounds"]
+        candidates = []
+        for node in nodes:
+            if node is title:
+                continue
+            text = node["text"]
+            if len(_only_digits(text)) < 10:
+                continue
+            nx1, ny1, nx2, ny2 = node["bounds"]
+            if ny1 < ty1 - 20 or ny1 > ty2 + 220:
+                continue
+            if nx2 < tx1 - 40:
+                continue
+            if _masked_card_matches(saved, text):
+                candidates.append(node)
+        if not candidates:
+            continue
+        number = sorted(candidates, key=lambda n: n["bounds"][1])[0]
+        nx1, ny1, nx2, ny2 = number["bounds"]
+        log(f"matched UnionPay card: saved={saved[:8]}...{saved[-4:]} screen={number['text']}")
+        cx, cy = _center(number["bounds"])
+        d.click(cx, cy)
+        time.sleep(0.8)
+        try:
+            verify_unionpay_card_detail(d, saved, log=log, timeout=2.5)
+        except Exception:
+            tcx, tcy = _center(title["bounds"])
+            log("retry card tap on unionpay text")
+            d.click(tcx, tcy)
+            time.sleep(0.8)
+        verify_unionpay_card_detail(d, saved, log=log)
+        click_transfer_on_unionpay_detail(d, log=log)
+        return True
+
+    raise RuntimeError(f"UnionPay card number mismatch for saved card ending {saved[-4:]}")
+
+
 # ----------------- login -----------------
 def at_login(d):
     if d.app_current().get("activity", "").endswith("BcelOneLogin"):
@@ -222,8 +1753,28 @@ def connect(serial, password="", username="", log=print, fresh=False):
     session alive so repeated calls skip the slow login). Logs in only if the
     session actually expired. Pass fresh=True to force a clean restart."""
     d = u2.connect(serial)
-    d.app_start(PKG, stop=fresh)
-    time.sleep(1.5)
+    cur = d.app_current()
+
+    if fresh:
+        d.app_start(PKG, stop=True)
+        time.sleep(1.5)
+    elif cur.get("package") == PKG:
+        by_pass_popup_network_failure(d)
+        if at_login(d):
+            do_login(d, password, username, log=log)
+            return d
+        if is_home(d) or d(text="My QR").exists:
+            log("reuse current BCEL home")
+            return d
+        log(f"resume BCEL from {cur.get('activity')}")
+        if go_home(d, log=log):
+            return d
+        d.app_start(PKG, stop=False)
+        time.sleep(1.5)
+    else:
+        d.app_start(PKG, stop=False)
+        time.sleep(1.5)
+
     # A "Session expired" / network-failure popup can sit IN FRONT of the login
     # screen — dismiss it FIRST, otherwise at_login() misses it and we never
     # re-login. Retry a few times: dismissing the popup reveals the login screen.

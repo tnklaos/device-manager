@@ -68,6 +68,10 @@ def save_settings(data):
         json.dump(data, f, indent=2)
 
 
+def only_digits(value):
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
 def adb(*args, timeout=15):
     # Always bound the call: a flaky Wi-Fi device can wedge the adb server, and
     # without a timeout subprocess.run would hang the monitor thread AND the
@@ -160,6 +164,9 @@ class Engine:
         self._sent_lock = threading.Lock()
         self._SENT_MAX = 10000          # kept in memory
         self._SENT_PERSIST = 3000       # kept on disk
+        self._withdraw_prepare_lock = threading.Lock()
+        self._withdraw_prepare_active = False
+        self._withdraw_prepare_serial = ""
         for k in self.settings.get("sent_refs", []):
             self._sent_refs[k] = True
 
@@ -186,7 +193,172 @@ class Engine:
                 pass
 
     def log(self, msg):
+        print(msg, flush=True)
         self.emit("log", {"msg": msg})
+
+    def debug(self, title, payload=None, source=""):
+        self.emit("debug", {
+            "title": title,
+            "source": source or "",
+            "payload": payload or {},
+        })
+
+    def _device_activity_snapshot(self):
+        devices = self.devices()
+        return {
+            "has_started_device": any(d.get("monitoring") for d in devices),
+            "active_withdraw_device": next(
+                (d.get("serial") for d in devices if d.get("role") == "withdraw" and d.get("monitoring")),
+                ""
+            ),
+            "devices": [{
+                "serial": d.get("serial", ""),
+                "role": d.get("role", "deposit"),
+                "started": bool(d.get("monitoring")),
+                "status": d.get("status", "idle"),
+                "state": d.get("state", ""),
+            } for d in devices],
+        }
+
+    def _prepare_withdraw_device(self, serial, to_account, to_name, amount, remark=""):
+        creds = self.device_creds(serial)
+        pwd = creds.get("password", "") or ""
+        user = creds.get("username", "") or ""
+        card_no = creds.get("card_no", "") or ""
+        account_no = creds.get("account_no", "") or ""
+        security_answers = {
+            "withdraw_a1": creds.get("withdraw_a1", "") or "",
+            "withdraw_a2": creds.get("withdraw_a2", "") or "",
+            "withdraw_a3": creds.get("withdraw_a3", "") or "",
+        }
+        try:
+            self.log(f"… {serial}: opening BCEL One for withdraw request")
+            d = bcel.connect(serial, pwd, user, log=lambda msg: self.log(f"   {serial}: {msg}"), fresh=False)
+            bcel.select_unionpay_card(d, card_no, log=lambda msg: self.log(f"   {serial}: {msg}"))
+            bcel.verify_transfer_money_page(d, log=lambda msg: self.log(f"   {serial}: {msg}"))
+            bcel.select_source_account_on_transfer_page(d, account_no, log=lambda msg: self.log(f"   {serial}: {msg}"))
+            bcel.verify_receiver_account_page(d, log=lambda msg: self.log(f"   {serial}: {msg}"))
+            bcel.input_receiver_account(d, to_account, log=lambda msg: self.log(f"   {serial}: {msg}"))
+            bcel.click_receiver_next(d, log=lambda msg: self.log(f"   {serial}: {msg}"))
+            bcel.verify_transfer_amount_page(
+                d,
+                account_no,
+                to_account,
+                to_name,
+                log=lambda msg: self.log(f"   {serial}: {msg}")
+            )
+            bcel.input_transfer_amount(d, amount, log=lambda msg: self.log(f"   {serial}: {msg}"))
+            bcel.click_receiver_next(d, log=lambda msg: self.log(f"   {serial}: {msg}"))
+            bcel.input_security_answer(
+                d,
+                security_answers,
+                log=lambda msg: self.log(f"   {serial}: {msg}")
+            )
+            bcel.input_transfer_description(
+                d,
+                remark,
+                log=lambda msg: self.log(f"   {serial}: {msg}")
+            )
+            bcel.verify_transfer_confirmation_page(
+                d,
+                account_no,
+                to_account,
+                to_name,
+                log=lambda msg: self.log(f"   {serial}: {msg}")
+            )
+            bcel.click_transfer_confirm(
+                d,
+                log=lambda msg: self.log(f"   {serial}: {msg}")
+            )
+            bcel.check_transfer_result_modal(
+                d,
+                log=lambda msg: self.log(f"   {serial}: {msg}")
+            )
+            self.log(f"✓ {serial}: BCEL One ready for withdraw flow")
+        except Exception as e:
+            self.log(f"✗ {serial}: withdraw app prepare failed: {e}")
+            try:
+                if "d" in locals() and d is not None:
+                    bcel.recover_to_bcel_home(
+                        d,
+                        log=lambda msg: self.log(f"   {serial}: {msg}")
+                    )
+            except Exception as recover_error:
+                self.log(f"   {serial}: home recovery failed: {recover_error}")
+        finally:
+            with self._withdraw_prepare_lock:
+                if self._withdraw_prepare_serial == serial:
+                    self._withdraw_prepare_active = False
+                    self._withdraw_prepare_serial = ""
+
+    def receive_withdraw_request(self, payload, source=""):
+        source = (source or "unknown").strip()
+        payload = payload or {}
+        withdrawal_id = str(payload.get("withdrawalId") or payload.get("withdraw_id") or "").strip()
+        amount = payload.get("amount")
+        currency = str(payload.get("currency") or "").strip()
+        to_bank = str(payload.get("toBank") or "").strip()
+        to_account = str(payload.get("toAccount") or "").strip()
+        to_name = str(payload.get("toName") or "").strip()
+        remark = str(payload.get("remark") or payload.get("note") or payload.get("description") or "").strip()
+        try:
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            body = "{}"
+        summary = (
+            f"withdrawalId={withdrawal_id or '-'} "
+            f"amount={amount if amount is not None else '-'} "
+            f"currency={currency or '-'} "
+            f"toBank={to_bank or '-'} "
+            f"toAccount={to_account or '-'} "
+            f"toName={to_name or '-'}"
+        )
+        snapshot = self._device_activity_snapshot()
+        active = snapshot.get("active_withdraw_device") or "-"
+        started = "yes" if snapshot.get("has_started_device") else "no"
+        self.log(f"↘ withdraw request from {source}: {summary}")
+        self.log(f"   device activity: started={started} active_withdraw_device={active}")
+        for d in snapshot.get("devices", []):
+            self.log(
+                f"   device {d.get('serial')}: role={d.get('role')} "
+                f"started={'yes' if d.get('started') else 'no'} "
+                f"status={d.get('status')} state={d.get('state')}"
+            )
+        if snapshot.get("active_withdraw_device"):
+            with self._withdraw_prepare_lock:
+                if self._withdraw_prepare_active:
+                    serial = self._withdraw_prepare_serial or snapshot["active_withdraw_device"]
+                    msg = f"withdraw device {serial} is busy opening BCEL One"
+                    self.log(f"⚠ {msg}")
+                    self.debug("POST /api/withdraws", {
+                        "request": payload,
+                        "deviceActivity": snapshot,
+                        "rejected": True,
+                        "message": msg,
+                    }, source)
+                    return {"ok": False, "accepted": False, "message": msg, "code": 409}
+                self._withdraw_prepare_active = True
+                self._withdraw_prepare_serial = snapshot["active_withdraw_device"]
+            threading.Thread(
+                target=self._prepare_withdraw_device,
+                args=(snapshot["active_withdraw_device"], to_account, to_name, amount, remark),
+                daemon=True,
+            ).start()
+        else:
+            msg = "no active withdraw device is started"
+            self.log(f"⚠ withdraw request received but {msg}")
+            self.debug("POST /api/withdraws", {
+                "request": payload,
+                "deviceActivity": snapshot,
+                "rejected": True,
+                "message": msg,
+            }, source)
+            return {"ok": False, "accepted": False, "message": msg, "code": 409}
+        self.debug("POST /api/withdraws", {
+            "request": payload,
+            "deviceActivity": snapshot,
+        }, source)
+        return {"ok": True, "accepted": True}
 
     # ---------- settings (global) ----------
     def get_settings(self):
@@ -278,13 +450,35 @@ class Engine:
     def device_creds(self, serial):
         return self.settings.get("devices", {}).get(serial, {})
 
-    def save_device_creds(self, serial, username=None, password=None):
+    def save_device_creds(self, serial, username=None, password=None, role=None,
+                          card_no=None, account_no=None,
+                          withdraw_q1=None, withdraw_a1=None,
+                          withdraw_q2=None, withdraw_a2=None,
+                          withdraw_q3=None, withdraw_a3=None):
         with self._slock:
             dev = self.settings.setdefault("devices", {}).setdefault(serial, {})
             if username is not None:
                 dev["username"] = username
             if password is not None:
                 dev["password"] = password
+            if role is not None:
+                dev["role"] = role if role in {"deposit", "withdraw"} else "deposit"
+            if card_no is not None:
+                dev["card_no"] = only_digits(card_no)
+            if account_no is not None:
+                dev["account_no"] = only_digits(account_no)
+            if withdraw_q1 is not None:
+                dev["withdraw_q1"] = withdraw_q1
+            if withdraw_a1 is not None:
+                dev["withdraw_a1"] = withdraw_a1
+            if withdraw_q2 is not None:
+                dev["withdraw_q2"] = withdraw_q2
+            if withdraw_a2 is not None:
+                dev["withdraw_a2"] = withdraw_a2
+            if withdraw_q3 is not None:
+                dev["withdraw_q3"] = withdraw_q3
+            if withdraw_a3 is not None:
+                dev["withdraw_a3"] = withdraw_a3
             save_settings(self.settings)
 
     def set_last_ref(self, serial, ref):
@@ -304,6 +498,15 @@ class Engine:
                 "has_creds": bool(self.device_creds(s).get("password")),
                 "last_ref": self.device_creds(s).get("last_ref", ""),
                 "username": self.device_creds(s).get("username", ""),
+                "role": self.device_creds(s).get("role", "deposit"),
+                "card_no": self.device_creds(s).get("card_no", ""),
+                "account_no": self.device_creds(s).get("account_no", ""),
+                "has_withdraw_q1": bool(self.device_creds(s).get("withdraw_q1")),
+                "has_withdraw_a1": bool(self.device_creds(s).get("withdraw_a1")),
+                "has_withdraw_q2": bool(self.device_creds(s).get("withdraw_q2")),
+                "has_withdraw_a2": bool(self.device_creds(s).get("withdraw_a2")),
+                "has_withdraw_q3": bool(self.device_creds(s).get("withdraw_q3")),
+                "has_withdraw_a3": bool(self.device_creds(s).get("withdraw_a3")),
                 "set": self.device_creds(s).get("set", ""),
                 "cycle": self._cycles.get(s, 0),
             })
@@ -318,6 +521,18 @@ class Engine:
     # ---------- monitor control ----------
     def start(self, serial):
         if self._monitors.get(serial, {}).get("active"):
+            return
+        role = self.device_creds(serial).get("role", "deposit")
+        if role == "withdraw":
+            st = device_state(serial)
+            if st != "device":
+                reason = _STATE_REASON.get(st, f"state '{st}'")
+                self._set_status(serial, "unauthorized" if st == "unauthorized" else "disconnected")
+                self.log(f"⚠ {serial}: {reason}")
+                return
+            self._monitors[serial] = {"active": True, "mode": "withdraw"}
+            self._set_status(serial, "monitoring")
+            self.log(f"▶ {serial}: withdraw device started (runner not implemented yet)")
             return
         # don't spin up a monitor for a device adb can't actually drive
         st = device_state(serial)

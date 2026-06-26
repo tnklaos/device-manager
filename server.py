@@ -51,7 +51,20 @@ def stop(serial):
 @app.post("/api/devices/<path:serial>/creds")
 def creds(serial):
     b = request.get_json(force=True, silent=True) or {}
-    eng.save_device_creds(serial, b.get("username"), b.get("password"))
+    eng.save_device_creds(
+        serial,
+        b.get("username"),
+        b.get("password"),
+        b.get("role"),
+        b.get("card_no"),
+        b.get("account_no"),
+        b.get("withdraw_q1"),
+        b.get("withdraw_a1"),
+        b.get("withdraw_q2"),
+        b.get("withdraw_a2"),
+        b.get("withdraw_q3"),
+        b.get("withdraw_a3"),
+    )
     if "last_ref" in b:
         eng.set_last_ref(serial, b.get("last_ref") or "")
     return jsonify(ok=True)
@@ -112,6 +125,15 @@ def transactions():
 def transactions_clear():
     eng.clear_transactions()
     return jsonify(ok=True)
+
+
+@app.post("/api/withdraws")
+def withdraws_create():
+    b = request.get_json(force=True, silent=True) or {}
+    src = request.headers.get("X-Forwarded-For") or request.remote_addr or ""
+    res = eng.receive_withdraw_request(b, src)
+    status = int(res.pop("code", 200))
+    return jsonify(**res, received_at=time.time()), status
 
 
 @app.get("/api/sync/status")
