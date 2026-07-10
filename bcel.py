@@ -378,7 +378,12 @@ def row_source(sig):
         idx = 5 if "ONEPAY" in ttype else 2
         return (parts[idx] if len(parts) > idx else ""), \
                (parts[5] if len(parts) > 5 else "")
-    mf = re.search(r"ຈາກບັນຊີ:\s*(.*?)\s*(?=ລາຍລະອຽດ:|ຫາບັນຊີ:|ເລກອ້າງອິງ:|ເລກໃບບິນ:|$)", sig)
+    mf = re.search(
+        r"ຈາກບັນຊີ:\s*(.*?)\s*"
+        r"(?=-?\s*[\d,]+(?:\.\d+)?\s*(?:LAK|USD)|ລາຍລະອຽດ:|"
+        r"ຫາບັນຊີ:|ເລກອ້າງອິງ:|ເລກໃບບິນ:|$)",
+        sig,
+    )
     if mf:
         val = mf.group(1).strip()
         sp = re.split(r"\s+-\s+", val, maxsplit=1)
@@ -386,6 +391,64 @@ def row_source(sig):
             return sp[1].strip(), sp[0].strip()       # account, name
         return val, ""
     return "", ""
+
+
+def detail_source(rec):
+    """(from_account, from_name) from the VERIFIED detail record's raw[], anchored
+    on the "ຈາກບັນຊີ" label / the pipe statement (NOT a fixed index and NOT the
+    list-row text). This keeps the sender name consistent with the SAME transaction
+    whose amount/ref we read from the detail — the previous approach pulled the name
+    from a separate list-row snapshot, so a stale/bled row could attach the wrong
+    sender (e.g. user2's transfer showing user1's name)."""
+    raw = rec.get("raw", []) or []
+    # QR / LMPS pipe statement: <type>|<bank>|<from-acct>|<bank>|<to-acct>|<name>|...
+    for seg in raw:
+        if "|" in seg:
+            parts = [p.strip() for p in seg.split("|")]
+            ttype = parts[0].upper().replace(" ", "") if parts else ""
+            idx = 5 if "ONEPAY" in ttype else 2
+            return (parts[idx] if len(parts) > idx else ""), \
+                   (parts[5] if len(parts) > 5 else "")
+    # regular transfer: the value ("NAME\naccount") follows the "ຈາກບັນຊີ" label
+    for i, seg in enumerate(raw):
+        s = seg.strip()
+        if s.rstrip(":") == "ຈາກບັນຊີ":                 # pure label -> value is next
+            val = raw[i + 1].strip() if i + 1 < len(raw) else ""
+        elif s.startswith("ຈາກບັນຊີ") and len(s) > len("ຈາກບັນຊີ") + 1:
+            val = s[len("ຈາກບັນຊີ"):].lstrip(": ").strip()  # label+value in one node
+        else:
+            continue
+        sp = [p for p in re.split(r"\n|\s+-\s+", val, maxsplit=1)]
+        if len(sp) > 1:
+            return sp[1].strip(), sp[0].strip()          # account, name
+        return val, ""
+    return "", ""
+
+
+def _normalized_name(value):
+    """Comparable sender name without changing the value sent to the gateway."""
+    return re.sub(r"\s+", " ", value or "").strip().casefold()
+
+
+def _accounts_conflict(left, right):
+    """Return True only when two account values are clearly different.
+
+    BCEL sometimes masks one representation, so an incomplete/masked value is not
+    enough evidence of a conflict. When both expose at least four digits, the last
+    four must agree.
+    """
+    ld = re.sub(r"\D", "", left or "")
+    rd = re.sub(r"\D", "", right or "")
+    return len(ld) >= 4 and len(rd) >= 4 and ld[-4:] != rd[-4:]
+
+
+def _detail_fingerprint(rec):
+    """Fields that must stop changing before a detail record is accepted."""
+    return (
+        rec.get("type", ""), rec.get("kind", ""), rec.get("time", ""),
+        rec.get("bill_no", ""), rec.get("amount_in", ""), rec.get("amount", ""),
+        tuple(rec.get("raw", []) or []),
+    )
 
 
 def _extract_message_detail(d):
@@ -565,7 +628,11 @@ def _list_rows(d):
     rows = []
     for (y1, y2, center) in conts:
         rt = [t for (yc, t) in texts if y1 <= yc <= y2]
-        sig = " | ".join(rt)
+        # Keep UI nodes separated without inventing a pipe. A literal `|` has
+        # banking meaning in QR/LMPS statements, and row_source() uses it to choose
+        # that parser. Joining ordinary transfer fields with `|` made TRI rows look
+        # like QR statements and could select an unrelated/previous sender field.
+        sig = "\n".join(rt)
         # the row's leading badge text is the kind code (TRI/TRO/ACC/SAL/TOP)
         km = re.search(r"\b(TRI|TRO|ACC|SAL|TOP|TFO)\b", sig)
         kind = km.group(1) if km else ""
@@ -608,18 +675,83 @@ def _hhmmss(text):
 
 def detail_matches_row(row_sig, rec):
     """Verify the opened detail belongs to the row that was clicked, by comparing
-    the amount and the HH:MM:SS timestamp that appear in BOTH the list row and the
-    detail. A *conflict* on either means the tap opened the wrong transaction
-    (off-by-one, list shifted mid-tap); we require at least one positive match and
-    zero conflicts. This guards against recording the wrong amount/ref."""
+    the amount, HH:MM:SS timestamp, and sender that appear in BOTH the list row and
+    detail. Amount and time are mandatory; accepting only one lets a half-rendered
+    WebView record combine the new transaction's ref/amount with the previous
+    transaction's sender. Sender/account conflicts are also rejected, but a source
+    omitted by one side is allowed for transaction types that do not expose it."""
     ra = _amount_value(row_sig)
     da = _amount_value(rec.get("amount_in") or rec.get("amount") or "")
     rt, dt = _hhmmss(row_sig), _hhmmss(rec.get("time") or "")
-    if ra is not None and da is not None and ra != da:
-        return False                      # amount conflict -> wrong detail
-    if rt and dt and rt != dt:
-        return False                      # time conflict -> wrong detail
-    return bool((ra is not None and da is not None and ra == da) or (rt and dt and rt == dt))
+    if ra is None or da is None or ra != da:
+        return False                      # absent/conflicting amount -> incomplete/wrong
+    if not rt or not dt or rt != dt:
+        return False                      # absent/conflicting time -> incomplete/wrong
+
+    row_account, row_name = row_source(row_sig)
+    detail_account, detail_name = detail_source(rec)
+    if (row_name and detail_name
+            and _normalized_name(row_name) != _normalized_name(detail_name)):
+        return False                      # sender-name bleed from a different row/detail
+    if _accounts_conflict(row_account, detail_account):
+        return False                      # clearly different source account
+    return True
+
+
+def _read_verified_detail(d, row, log=print):
+    """Open one row and return (stable detail, exact verified row signature).
+
+    The WebView can expose old and new values in the same transition, so a record
+    is accepted only after three identical complete snapshots match the current
+    list row. A mismatch is retried without returning partial transaction data.
+    """
+    for attempt in range(3):
+        # Re-locate the row by its stable key (its pixel center may have moved).
+        cur = next((r for r in _list_rows(d) if r["key"] == row["key"]), None)
+        if cur is None:
+            return None                           # row scrolled away
+        d.click(*cur["center"])
+        rec, opened = None, False
+        stable_fingerprint, stable_reads = None, 0
+        deadline = time.time() + 10               # wait up to 10s for a slow load
+        while time.time() < deadline:
+            time.sleep(0.5)
+            r = _extract_message_detail(d)
+            if r.get("type"):                    # detail container is on screen
+                opened = True
+                # A WebView can briefly expose a mixed tree while navigating:
+                # new amount/ref with the previous sender name. Require the
+                # entire relevant detail to be unchanged across three reads,
+                # and compare it with the CURRENT row snapshot before accepting.
+                if ((r.get("amount_in") or r.get("amount"))
+                        and detail_matches_row(cur["sig"], r)):
+                    fingerprint = _detail_fingerprint(r)
+                    if fingerprint == stable_fingerprint:
+                        stable_reads += 1
+                    else:
+                        stable_fingerprint, stable_reads = fingerprint, 1
+                    if stable_reads >= 3:
+                        rec = r
+                        break
+                else:
+                    stable_fingerprint, stable_reads = None, 0
+        if opened:                                # close the detail we opened
+            try:
+                d(text="Close").click()
+            except Exception:
+                d.press("back")
+            time.sleep(0.6)
+        if rec:
+            # Preserve the exact row snapshot used for verification. The list may
+            # have refreshed since the row was first selected.
+            return rec, cur["sig"]
+        log(f"detail not ready/mismatch for {row['key']} (attempt {attempt + 1}/3) — retrying")
+        # If the tap never opened a detail and we left the list, get back to it.
+        if not opened and not _list_rows(d):
+            d.press("back")
+            time.sleep(0.5)
+    log(f"⚠ could not read a complete matching detail for {row['key']} — skipped this cycle")
+    return None
 
 
 def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6,
@@ -643,52 +775,12 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         # money received: has an "ເງິນເຂົ້າ" (amount_in) value, or the title says received
         return bool(rec.get("amount_in")) or str(rec.get("type", "")).startswith("ໄດ້ຮັບ")
 
-    def read(row):
-        # Open a row's detail, WAIT until it has fully rendered, then VERIFY it's
-        # the one we clicked (amount + time must match the list row). Two hazards
-        # under slow internet / slow app:
-        #   1) the detail opens late -> never read the list as if the tap missed;
-        #   2) the detail renders half-loaded -> the bill number isn't there yet and
-        #      we'd record a fallback ref. So we poll for the detail AND its value
-        #      fields (amount) before accepting, up to a timeout, instead of a fixed
-        #      sleep. On mismatch/incomplete we retry; we never return partial/wrong.
-        for attempt in range(3):
-            # re-locate the row by its stable key (its pixel center may have moved)
-            cur = next((r for r in _list_rows(d) if r["key"] == row["key"]), None)
-            if cur is None:
-                return None                       # row scrolled away — let caller move on
-            d.click(*cur["center"])
-            rec, opened = None, False
-            deadline = time.time() + 10           # wait up to 10s for a slow load
-            while time.time() < deadline:
-                time.sleep(0.5)
-                r = _extract_message_detail(d)
-                if r.get("type"):                 # detail container is on screen
-                    opened = True
-                    if r.get("amount_in") or r.get("amount"):
-                        rec = r                   # value fields rendered -> fully loaded
-                        break
-            if opened:                            # close the detail we opened
-                try:
-                    d(text="Close").click()
-                except Exception:
-                    d.press("back")
-                time.sleep(0.6)
-            if rec and detail_matches_row(row["sig"], rec):
-                return rec                        # verified + complete
-            log(f"detail not ready/mismatch for {row['key']} (attempt {attempt + 1}/3) — retrying")
-            # if the tap never opened a detail and we left the list, get back to it
-            if not opened and not _list_rows(d):
-                d.press("back")
-                time.sleep(0.5)
-        log(f"⚠ could not read a complete matching detail for {row['key']} — skipped this cycle")
-        return None
-
     seen = set()           # row keys already handled (stable across scroll)
     done_refs = set()      # detail refs already collected — guards double-send
     new, new_top = [], None
     scrolls = 0
     matched = False
+    blocked = False        # an incoming row could not be verified; hold old watermark
     guard = 0
     while not matched and guard < 120:
         guard += 1
@@ -710,8 +802,17 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         seen.add(nextrow["key"])
         if not nextrow["incoming"]:               # skip outgoing — don't open it
             continue
-        rec = read(nextrow)                       # open detail -> real ref/bill_no
-        if not rec or not detail_incoming(rec):   # confirm money received
+        read_result = _read_verified_detail(d, nextrow, log=log)
+        if not read_result:
+            # Do not scan past an unreadable incoming row and then advance the
+            # watermark to a newer verified row. That would strand this transaction
+            # behind the watermark forever. Verified rows above it may still send;
+            # global ref dedup makes their retry safe while the old watermark is held.
+            blocked = True
+            log(f"⚠ holding watermark at {last_ref or '(unset)'} — incoming row {nextrow['key']} was not verified")
+            break
+        rec, verified_row_sig = read_result
+        if not detail_incoming(rec):               # confirm money received
             continue
         # reached a transaction we already sent last time -> STOP (do NOT include it)
         if last_ref is not None and rec["ref"] == last_ref:
@@ -722,9 +823,13 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         if rec["ref"] in done_refs:
             continue
         done_refs.add(rec["ref"])
-        # source account comes from the reliable list-row text, not the detail
-        # page (whose field order shifts across devices).
-        fa, fn = row_source(nextrow["sig"])
+        # Source the sender from the SAME verified detail (label-anchored), so the
+        # name can't come from a different/stale list-row snapshot and get attached
+        # to the wrong transaction. Fall back to the list-row text only if the
+        # detail didn't yield a counterparty.
+        fa, fn = detail_source(rec)
+        if not (fa or fn):
+            fa, fn = row_source(verified_row_sig)
         if fa or fn:
             rec["from_account"], rec["from_name"] = fa, fn
         # the newest incoming we read becomes the next watermark
@@ -739,7 +844,9 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         # otherwise it's new -> collect it
         new.append(rec)
 
-    return {"first_run": last_ref is None, "last_ref": new_top or last_ref, "new": new}
+    return {"first_run": last_ref is None,
+            "last_ref": last_ref if blocked else (new_top or last_ref),
+            "new": new}
 
 
 def get_messages(serial, password="", username="", max_scrolls=8, log=print):

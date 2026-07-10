@@ -77,9 +77,10 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 .badge.idle { background: #1a212e; color: var(--sub); }
 .badge.monitoring { background: #1e2a52; color: #c7d2fe; }
 .badge.disconnected { background: #3a1620; color: #fecaca; }
-.devcard .meta { color: var(--sub); font-size: 12px; margin: 12px 0; display: flex; gap: 14px; }
+.devcard .meta { color: var(--sub); font-size: 12px; margin: 12px 0; display: flex; gap: 8px 14px; flex-wrap: wrap; }
 .devcard .meta .ok { color: var(--green); }
 .devcard .meta .warn { color: #f59e0b; }
+.devcard .meta .connection-warning { flex-basis: 100%; line-height: 1.4; }
 .devcard .actions { display: flex; gap: 6px; flex-wrap: nowrap; align-items: center; }
 .devcard .actions .btn { flex-shrink: 0; }
 
@@ -149,11 +150,12 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 .form-card { max-width: 520px; }
 .form-card h2 { margin: 0 0 4px; font-size: 16px; }
 .card label, .modal label { display: block; color: var(--sub); font-size: 12px; margin: 14px 0 6px; }
-.card input, .modal input {
+.card input, .card select, .modal input {
   display: block; width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--text);
   border-radius: 9px; padding: 10px 12px; font-size: 13px; outline: none;
 }
-.card input:focus, .modal input:focus { border-color: var(--indigo); }
+.card input:focus, .card select:focus, .modal input:focus { border-color: var(--indigo); }
+.setting-status { min-height: 18px; margin-top: 12px; font-size: 12px; }
 .row-actions { display: flex; align-items: center; gap: 12px; margin-top: 18px; }
 
 /* Guide */

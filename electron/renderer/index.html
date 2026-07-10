@@ -52,7 +52,7 @@
       <section id="view-devices" class="view">
         <div id="devices-grid" class="grid"></div>
         <div id="devices-empty" class="empty hidden">
-          No devices found. Connect a phone over USB or pair via Wireless debugging.
+          No devices found. Unlock the phone and set USB mode to File Transfer, or pair via Wireless debugging.
         </div>
       </section>
 
@@ -108,6 +108,22 @@
           </div>
           <label>Public URL</label>
           <input id="sync-url" type="text" readonly placeholder="(not running)" />
+        </div>
+
+        <!-- global transaction/activity log retention -->
+        <div id="logs-editor" class="card form-card hidden" style="margin-top:16px">
+          <h2>Log retention</h2>
+          <p class="muted">Synced transaction logs are stored locally and automatically removed after this period. “Continue” keeps them until manually cleared.</p>
+          <label>Keep logs for</label>
+          <select id="log-retention">
+            <option value="1_day">1 Day</option>
+            <option value="15_days">15 Day</option>
+            <option value="30_days">30 Days</option>
+            <option value="2_months">2 Months</option>
+            <option value="continue">Continue</option>
+            <option value="1_year">1 year</option>
+          </select>
+          <div id="log-retention-status" class="muted setting-status"></div>
         </div>
       </section>
 

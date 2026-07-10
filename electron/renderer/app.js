@@ -63,9 +63,9 @@ function renderDevices() {
       </div>
 	      <div class="meta">
 	        <span class="${d.has_creds ? "ok" : ""}">${d.has_creds ? "● credentials set" : "○ no credentials"}</span>
-	        ${d.state && d.state !== "device"
-				? `<span class="warn">⚠ ${d.state === "unauthorized" ? "unauthorized — tap Allow on the phone" : d.state}</span>`
-				: ""}
+	        ${d.connection_message
+				? `<span class="warn connection-warning">⚠ ${esc(d.connection_message)}</span>`
+				: (d.state && d.state !== "device" ? `<span class="warn">⚠ ${esc(d.state)}</span>` : "")}
 	      </div>
 	      <div class="actions">
 	        ${running
@@ -175,17 +175,24 @@ $("#tx-clear").onclick = async () => {
 let sets = [];
 let activeSetId = "sync";          // tab selection: a set id, "new", or "sync"
 let defaultApi = "https://paymentgateway.108pay.co";
+let logRetention = "1_day";
+const logRetentionDays = {
+	"1_day": 1, "15_days": 15, "30_days": 30,
+	"2_months": 60, "continue": null, "1_year": 365,
+};
 
 async function loadSettings() {
 	const s = await api("/api/settings");
 	defaultApi = s.default_api_url || defaultApi;
+	logRetention = s.log_retention || "1_day";
+	$("#log-retention").value = logRetention;
 	$("#sync-token").placeholder = s.ngrok_token_set ? "•••••• (saved)" : "ngrok auth token";
 	await loadSets();
 }
 
 async function loadSets() {
 	sets = await api("/api/sets");
-	if (activeSetId !== "sync" && activeSetId !== "new" && !sets.find((x) => x.id === activeSetId))
+	if (!["sync", "logs", "new"].includes(activeSetId) && !sets.find((x) => x.id === activeSetId))
 		activeSetId = sets.length ? sets[0].id : "new";
 	renderSetTabs();
 	renderSetEditor();
@@ -198,7 +205,8 @@ function renderSetTabs() {
 		`<button class="settab ${activeSetId === s.id ? "active" : ""}" data-set="${s.id}">${esc(s.name || "Untitled")}</button>`
 	).join("");
 	html += `<button class="settab add ${activeSetId === "new" ? "active" : ""}" data-set="new">＋ Add set</button>`;
-	html += `<button class="settab ${activeSetId === "sync" ? "active" : ""}" data-set="sync" style="margin-left:auto">Sync</button>`;
+	html += `<button class="settab ${activeSetId === "logs" ? "active" : ""}" data-set="logs" style="margin-left:auto">Logs</button>`;
+	html += `<button class="settab ${activeSetId === "sync" ? "active" : ""}" data-set="sync">Sync</button>`;
 	bar.innerHTML = html;
 	bar.querySelectorAll(".settab").forEach((b) => {
 		b.onclick = () => { activeSetId = b.dataset.set; renderSetTabs(); renderSetEditor(); };
@@ -207,9 +215,12 @@ function renderSetTabs() {
 
 function renderSetEditor() {
 	const isSync = activeSetId === "sync";
-	$("#set-editor").classList.toggle("hidden", isSync);
+	const isLogs = activeSetId === "logs";
+	$("#set-editor").classList.toggle("hidden", isSync || isLogs);
 	$("#sync-editor").classList.toggle("hidden", !isSync);
+	$("#logs-editor").classList.toggle("hidden", !isLogs);
 	if (isSync) { refreshSync(); return; }
+	if (isLogs) { $("#log-retention").value = logRetention; return; }
 	const s = sets.find((x) => x.id === activeSetId);
 	const isNew = !s;
 	$("#set-editor-title").textContent = isNew ? "New gateway set" : (s.name || "Gateway set");
@@ -220,6 +231,21 @@ function renderSetEditor() {
 	$("#set-delete").style.display = isNew ? "none" : "";
 	$("#set-status").textContent = "";
 }
+
+$("#log-retention").onchange = async (event) => {
+	const value = event.target.value;
+	$("#log-retention-status").textContent = "Saving…";
+	const result = await post("/api/settings/log-retention", { value });
+	logRetention = result.log_retention || "1_day";
+	event.target.value = logRetention;
+	pruneActivityLog();
+	await loadTransactions();
+	const removed = Number(result.removed) || 0;
+	$("#log-retention-status").textContent = removed
+		? `Saved — removed ${removed} expired log${removed === 1 ? "" : "s"}`
+		: "Saved ✓";
+	setTimeout(() => ($("#log-retention-status").textContent = ""), 5000);
+};
 
 $("#set-save").onclick = async () => {
 	$("#set-status").textContent = "Saving…";
@@ -334,14 +360,27 @@ $("#m-save").onclick = async () => {
 };
 
 // ---------- activity log dock ----------
+let activityLog = [];
 $("#logdock-toggle").onclick = () => {
 	$("#log").classList.toggle("collapsed");
 	$("#log-hint").textContent = $("#log").classList.contains("collapsed") ? "▴" : "▾";
 };
-function logLine(msg) {
+function renderActivityLog() {
 	const el = $("#log");
-	el.textContent += msg + "\n";
+	el.textContent = activityLog.map((entry) => entry.msg).join("\n") + (activityLog.length ? "\n" : "");
 	el.scrollTop = el.scrollHeight;
+}
+function pruneActivityLog() {
+	const days = logRetentionDays[logRetention];
+	if (days !== null && days !== undefined) {
+		const cutoff = Date.now() / 1000 - days * 86400;
+		activityLog = activityLog.filter((entry) => entry.ts >= cutoff);
+	}
+	renderActivityLog();
+}
+function logLine(msg, ts = Date.now() / 1000) {
+	activityLog.push({ msg, ts });
+	pruneActivityLog();
 }
 
 // ---------- live event stream (SSE) ----------
@@ -351,9 +390,10 @@ function connectStream() {
 	es.onerror = () => { setBackend(false); };
 	es.onmessage = (e) => {
 		const evt = JSON.parse(e.data);
-		if (evt.kind === "log") logLine(evt.data.msg);
+		if (evt.kind === "log") logLine(evt.data.msg, evt.ts);
 		else if (evt.kind === "device") loadDevices();
-		else if (evt.kind === "transaction") { txns.push(evt.data); renderTransactions(); logLine(`📩 synced ${evt.data.type} ${evt.data.amount}`); }
+		else if (evt.kind === "transaction") { txns.push(evt.data); renderTransactions(); logLine(`📩 synced ${evt.data.type} ${evt.data.amount}`, evt.ts); }
+		else if (evt.kind === "transactions_pruned") loadTransactions();
 		else if (evt.kind === "pair") {
 			$("#qr-status").textContent = evt.data.status || "";
 			if (evt.data.done) { setTimeout(() => $("#qr-modal").classList.add("hidden"), 1500); loadDevices(); }
@@ -385,5 +425,6 @@ async function boot() {
 	connectStream();
 	// light polling as a fallback for device hot-plug
 	setInterval(loadDevices, 5000);
+	setInterval(pruneActivityLog, 60000);
 }
 boot();

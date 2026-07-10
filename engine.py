@@ -38,11 +38,22 @@ if getattr(sys, "frozen", False):
     _cfg = os.path.join(os.path.expanduser("~"), ".device-manager")
     os.makedirs(_cfg, exist_ok=True)
     SETTINGS_FILE = os.path.join(_cfg, "settings.json")
+    TRANSACTIONS_FILE = os.path.join(_cfg, "transactions.json")
 else:
     SETTINGS_FILE = os.path.join(HERE, "settings.json")
+    TRANSACTIONS_FILE = os.path.join(HERE, "transactions.json")
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
 APP_VERSION = "1.0.3"
 MONITOR_INTERVAL = 60
+DEFAULT_LOG_RETENTION = "1_day"
+LOG_RETENTION_DAYS = {
+    "1_day": 1,
+    "15_days": 15,
+    "30_days": 30,
+    "2_months": 60,
+    "continue": None,
+    "1_year": 365,
+}
 # Fully restart the BCEL app (stop + start) every Nth poll cycle, per device.
 # This clears a stale/expired session and a frozen WebView instead of letting
 # them pile up between the lightweight resume-polls. At a 60s interval, 30 cycles
@@ -66,6 +77,45 @@ def load_settings():
 def save_settings(data):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def load_transactions():
+    try:
+        with open(TRANSACTIONS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_transactions(data):
+    """Persist display history separately from credentials/settings."""
+    try:
+        tmp = TRANSACTIONS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, TRANSACTIONS_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def normalize_log_retention(value):
+    return value if value in LOG_RETENTION_DAYS else DEFAULT_LOG_RETENTION
+
+
+def transaction_log_timestamp(record):
+    """Timestamp for retention, including transaction files from older builds."""
+    synced_at = record.get("synced_at")
+    if isinstance(synced_at, (int, float)):
+        return synced_at
+    bank_time = (record.get("time") or "").strip()
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return time.mktime(time.strptime(bank_time, fmt))
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def adb(*args, timeout=15):
@@ -121,6 +171,40 @@ _STATE_REASON = {
 }
 
 
+def usb_connection_status(serial, state, usb_config=""):
+    """User-facing USB data-mode state; Wi-Fi devices are not USB-checked."""
+    if ":" in serial:
+        return {"connection_type": "wifi", "data_transfer_mode": None,
+                "connection_message": ""}
+    if state == "unauthorized":
+        return {
+            "connection_type": "usb", "data_transfer_mode": False,
+            "connection_message": (
+                "USB data access is not ready. Select File Transfer on the phone, "
+                "then tap Allow USB debugging."
+            ),
+        }
+    if state != "device":
+        return {
+            "connection_type": "usb", "data_transfer_mode": False,
+            "connection_message": (
+                "USB data connection is unavailable. Unlock the phone, select "
+                "File Transfer, then reconnect the cable."
+            ),
+        }
+    modes = {part.strip().lower() for part in (usb_config or "").split(",")}
+    if "mtp" in modes:
+        return {"connection_type": "usb", "data_transfer_mode": True,
+                "connection_message": ""}
+    return {
+        "connection_type": "usb", "data_transfer_mode": False,
+        "connection_message": (
+            "USB is connected, but File Transfer mode is off. Open the phone's "
+            "USB options and select File Transfer."
+        ),
+    }
+
+
 def source_account(t):
     """Extract the (from_account, from_name) the money was transferred FROM,
     matching the gateway's handleAutoMateTransaction logic (raw[]-based)."""
@@ -148,11 +232,19 @@ class Engine:
         self._monitors = {}       # serial -> {"active": bool, "thread": Thread}
         self._status = {}         # serial -> status string
         self._cycles = {}         # serial -> current poll-cycle count (global, all devices)
-        self.transactions = []    # synced transactions (oldest first)
+        self._usb_modes = {}       # serial -> (checked_at, connection status)
+        self.transactions = load_transactions()  # synced transactions (oldest first)
         self._subs = []           # SSE subscriber queues
         # serializes settings mut-and-save across the per-device monitor threads
         # (and Flask request threads) so concurrent writers can't corrupt the file.
         self._slock = threading.RLock()
+        self._tx_lock = threading.RLock()
+        # Existing installs receive the safe 1-day default on first launch.
+        retention = normalize_log_retention(self.settings.get("log_retention"))
+        if self.settings.get("log_retention") != retention:
+            self.settings["log_retention"] = retention
+            with self._slock:
+                save_settings(self.settings)
         # global guard against ever posting the same bank reference twice (across
         # cycles, fresh restarts, and multiple devices). Bounded, newest-last, and
         # persisted (a tail) to settings so it also survives a full app restart.
@@ -162,6 +254,8 @@ class Engine:
         self._SENT_PERSIST = 3000       # kept on disk
         for k in self.settings.get("sent_refs", []):
             self._sent_refs[k] = True
+        self._prune_transactions(notify=False)
+        threading.Thread(target=self._retention_loop, daemon=True).start()
 
     def _save(self):
         with self._slock:
@@ -193,7 +287,16 @@ class Engine:
         return {
             "ngrok_token_set": bool(self.settings.get("ngrok_token")),
             "default_api_url": GATEWAY_API_URL,
+            "log_retention": normalize_log_retention(self.settings.get("log_retention")),
         }
+
+    def set_log_retention(self, value):
+        value = normalize_log_retention(value)
+        with self._slock:
+            self.settings["log_retention"] = value
+            save_settings(self.settings)
+        removed = self._prune_transactions()
+        return {"ok": True, "log_retention": value, "removed": removed}
 
     # ---------- setting sets (named gateway profiles) ----------
     def sets(self):
@@ -297,8 +400,10 @@ class Engine:
         out = []
         for d in list_devices():
             s = d["serial"]
+            connection = self._device_connection_status(s, d["state"])
             out.append({
                 **d,
+                **connection,
                 "monitoring": self._monitors.get(s, {}).get("active", False),
                 "status": self._status.get(s, "idle"),
                 "has_creds": bool(self.device_creds(s).get("password")),
@@ -309,11 +414,56 @@ class Engine:
             })
         return out
 
+    def _device_connection_status(self, serial, state):
+        # ADB shell cannot inspect an unauthorized/offline device, and Wi-Fi
+        # serials do not have a USB mode. Those cases are resolved immediately.
+        if ":" in serial or state != "device":
+            return usb_connection_status(serial, state)
+        cached = self._usb_modes.get(serial)
+        if cached and time.time() - cached[0] < 30:
+            return cached[1]
+        config = adb("-s", serial, "shell", "getprop", "sys.usb.state", timeout=5).strip()
+        status = usb_connection_status(serial, state, config)
+        self._usb_modes[serial] = (time.time(), status)
+        return status
+
     def transactions_list(self):
-        return self.transactions[-500:]
+        self._prune_transactions()
+        with self._tx_lock:
+            return list(self.transactions[-500:])
 
     def clear_transactions(self):
-        self.transactions = []
+        with self._tx_lock:
+            self.transactions = []
+            save_transactions(self.transactions)
+        self.emit("transactions_pruned", {"removed": "all"})
+
+    def _prune_transactions(self, notify=True):
+        """Remove transaction display logs older than the configured retention."""
+        value = normalize_log_retention(self.settings.get("log_retention"))
+        days = LOG_RETENTION_DAYS[value]
+        if days is None:                         # Continue = never auto-delete
+            return 0
+        cutoff = time.time() - days * 86400
+        with self._tx_lock:
+            before = len(self.transactions)
+            kept = []
+            for transaction in self.transactions:
+                timestamp = transaction_log_timestamp(transaction)
+                if timestamp is not None and timestamp >= cutoff:
+                    kept.append(transaction)
+            self.transactions = kept
+            removed = before - len(self.transactions)
+            if removed:
+                save_transactions(self.transactions)
+        if removed and notify:
+            self.emit("transactions_pruned", {"removed": removed})
+        return removed
+
+    def _retention_loop(self):
+        while True:
+            time.sleep(60)
+            self._prune_transactions()
 
     # ---------- monitor control ----------
     def start(self, serial):
@@ -578,6 +728,7 @@ class Engine:
                 with self._slock:
                     self.settings["sent_refs"] = tail
                     save_settings(self.settings)
+                added = []
                 for t in txns:
                     from_acct, from_name = source_account(t)
                     rec = {"serial": serial, "type": t.get("type", ""),
@@ -589,7 +740,12 @@ class Engine:
                            "ref": t.get("ref", "") or t.get("bill_no", ""),
                            "amount": t.get("amount_in") or t.get("amount") or "",
                            "time": t.get("time", ""), "synced_at": time.time()}
-                    self.transactions.append(rec)
+                    added.append(rec)
+                with self._tx_lock:
+                    self.transactions.extend(added)
+                    save_transactions(self.transactions)
+                self._prune_transactions()
+                for rec in added:
                     self.emit("transaction", rec)
                 return True
             # gateway reachable but rejected the batch (4xx) -> advance so one bad

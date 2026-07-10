@@ -62,6 +62,12 @@ def get_settings():
     return jsonify(eng.get_settings())
 
 
+@app.post("/api/settings/log-retention")
+def set_log_retention():
+    b = request.get_json(force=True, silent=True) or {}
+    return jsonify(eng.set_log_retention(b.get("value")))
+
+
 # ---------- setting sets (named gateway profiles) ----------
 @app.get("/api/sets")
 def get_sets():
