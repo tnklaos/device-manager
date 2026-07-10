@@ -113,15 +113,15 @@
         <!-- global transaction/activity log retention -->
         <div id="logs-editor" class="card form-card hidden" style="margin-top:16px">
           <h2>Log retention</h2>
-          <p class="muted">Synced transaction logs are stored locally and automatically removed after this period. “Continue” keeps them until manually cleared.</p>
+          <p class="muted">Synced transaction logs are stored locally and automatically removed after this period.</p>
           <label>Keep logs for</label>
           <select id="log-retention">
-            <option value="1_day">1 Day</option>
-            <option value="15_days">15 Day</option>
-            <option value="30_days">30 Days</option>
+            <option value="7_days">7 Days</option>
+            <option value="15_days">15 Days</option>
+            <option value="1_month">1 Month</option>
             <option value="2_months">2 Months</option>
-            <option value="continue">Continue</option>
-            <option value="1_year">1 year</option>
+            <option value="5_months">5 Months</option>
+            <option value="1_year">1 Year</option>
           </select>
           <div id="log-retention-status" class="muted setting-status"></div>
         </div>

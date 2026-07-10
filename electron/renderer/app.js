@@ -175,16 +175,16 @@ $("#tx-clear").onclick = async () => {
 let sets = [];
 let activeSetId = "sync";          // tab selection: a set id, "new", or "sync"
 let defaultApi = "https://paymentgateway.108pay.co";
-let logRetention = "1_day";
+let logRetention = "7_days";
 const logRetentionDays = {
-	"1_day": 1, "15_days": 15, "30_days": 30,
-	"2_months": 60, "continue": null, "1_year": 365,
+	"7_days": 7, "15_days": 15, "1_month": 30,
+	"2_months": 60, "5_months": 150, "1_year": 365,
 };
 
 async function loadSettings() {
 	const s = await api("/api/settings");
 	defaultApi = s.default_api_url || defaultApi;
-	logRetention = s.log_retention || "1_day";
+	logRetention = s.log_retention || "7_days";
 	$("#log-retention").value = logRetention;
 	$("#sync-token").placeholder = s.ngrok_token_set ? "•••••• (saved)" : "ngrok auth token";
 	await loadSets();
@@ -236,7 +236,7 @@ $("#log-retention").onchange = async (event) => {
 	const value = event.target.value;
 	$("#log-retention-status").textContent = "Saving…";
 	const result = await post("/api/settings/log-retention", { value });
-	logRetention = result.log_retention || "1_day";
+	logRetention = result.log_retention || "7_days";
 	event.target.value = logRetention;
 	pruneActivityLog();
 	await loadTransactions();

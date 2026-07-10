@@ -21,7 +21,7 @@ class LogRetentionTests(unittest.TestCase):
         now = time.time()
         with open(transactions_file, "w") as f:
             json.dump([
-                {"ref": "old", "synced_at": now - 2 * 86400},
+                {"ref": "old", "synced_at": now - 10 * 86400},
                 {"ref": "new", "synced_at": now - 60},
             ], f)
         stack = ExitStack()
@@ -31,20 +31,20 @@ class LogRetentionTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(engine.threading.Thread, "start"))
         return engine.Engine(), settings_file, transactions_file
 
-    def test_default_is_one_day_and_old_logs_are_pruned(self):
+    def test_default_is_seven_days_and_old_logs_are_pruned(self):
         eng, settings_file, _ = self.make_engine()
-        self.assertEqual(eng.get_settings()["log_retention"], "1_day")
+        self.assertEqual(eng.get_settings()["log_retention"], "7_days")
         self.assertEqual([t["ref"] for t in eng.transactions_list()], ["new"])
         with open(settings_file) as f:
-            self.assertEqual(json.load(f)["log_retention"], "1_day")
+            self.assertEqual(json.load(f)["log_retention"], "7_days")
 
-    def test_continue_keeps_old_logs(self):
-        eng, _, _ = self.make_engine("continue")
+    def test_one_year_keeps_ten_day_old_logs(self):
+        eng, _, _ = self.make_engine("1_year")
         self.assertEqual([t["ref"] for t in eng.transactions_list()], ["old", "new"])
 
     def test_shortening_retention_prunes_and_persists_immediately(self):
-        eng, _, transactions_file = self.make_engine("continue")
-        result = eng.set_log_retention("1_day")
+        eng, _, transactions_file = self.make_engine("1_year")
+        result = eng.set_log_retention("7_days")
         self.assertEqual(result["removed"], 1)
         with open(transactions_file) as f:
             self.assertEqual([t["ref"] for t in json.load(f)], ["new"])
@@ -54,12 +54,18 @@ class LogRetentionTests(unittest.TestCase):
         self.assertLess(engine.transaction_log_timestamp(old), time.time() - 86400)
 
     def test_bounded_retention_removes_log_with_unknown_age(self):
-        eng, _, transactions_file = self.make_engine("continue")
+        eng, _, transactions_file = self.make_engine("1_year")
         eng.transactions.append({"ref": "unknown", "time": ""})
-        result = eng.set_log_retention("1_day")
+        result = eng.set_log_retention("7_days")
         self.assertEqual(result["removed"], 2)
         with open(transactions_file) as f:
             self.assertEqual([t["ref"] for t in json.load(f)], ["new"])
+
+    def test_removed_old_option_migrates_to_seven_days(self):
+        eng, settings_file, _ = self.make_engine("continue")
+        self.assertEqual(eng.get_settings()["log_retention"], "7_days")
+        with open(settings_file) as f:
+            self.assertEqual(json.load(f)["log_retention"], "7_days")
 
 
 if __name__ == "__main__":

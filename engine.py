@@ -45,13 +45,13 @@ else:
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
 APP_VERSION = "1.0.4"
 MONITOR_INTERVAL = 60
-DEFAULT_LOG_RETENTION = "1_day"
+DEFAULT_LOG_RETENTION = "7_days"
 LOG_RETENTION_DAYS = {
-    "1_day": 1,
+    "7_days": 7,
     "15_days": 15,
-    "30_days": 30,
+    "1_month": 30,
     "2_months": 60,
-    "continue": None,
+    "5_months": 150,
     "1_year": 365,
 }
 # Fully restart the BCEL app (stop + start) every Nth poll cycle, per device.
@@ -239,7 +239,8 @@ class Engine:
         # (and Flask request threads) so concurrent writers can't corrupt the file.
         self._slock = threading.RLock()
         self._tx_lock = threading.RLock()
-        # Existing installs receive the safe 1-day default on first launch.
+        # Existing installs receive the configured default on first launch; values
+        # removed from the supported list also migrate to that default.
         retention = normalize_log_retention(self.settings.get("log_retention"))
         if self.settings.get("log_retention") != retention:
             self.settings["log_retention"] = retention
@@ -442,8 +443,6 @@ class Engine:
         """Remove transaction display logs older than the configured retention."""
         value = normalize_log_retention(self.settings.get("log_retention"))
         days = LOG_RETENTION_DAYS[value]
-        if days is None:                         # Continue = never auto-delete
-            return 0
         cutoff = time.time() - days * 86400
         with self._tx_lock:
             before = len(self.transactions)

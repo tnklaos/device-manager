@@ -60,5 +60,5 @@
     "20260710854345",
     "202607103941675"
   ],
-  "log_retention": "30_days"
+  "log_retention": "7_days"
 }
