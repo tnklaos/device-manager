@@ -174,6 +174,25 @@ def decode_qr(path):
 
 
 # ----------------- login -----------------
+_PASSWORD_INPUT_XPATH = (
+    f'//*[@package="{PKG}" and '
+    '(@hint="ລະຫັດຜ່ານ" or @password="true")]'
+)
+
+
+def password_input(d, timeout=15):
+    """Password field across BCEL/WebView variants.
+
+    Some Android 16 / WebView builds expose the secure EditText but omit its HTML
+    hint. Select by the semantic password attribute as a fallback; never by screen
+    coordinates.
+    """
+    field = d.xpath(_PASSWORD_INPUT_XPATH)
+    if not field.wait(timeout=timeout):
+        raise RuntimeError("BCEL password input is not exposed to accessibility")
+    return field
+
+
 def at_login(d):
     if d.app_current().get("activity", "").endswith("BcelOneLogin"):
         return True
@@ -184,7 +203,11 @@ def do_login(d, pwd, username="", log=print):
     if not pwd:
         raise RuntimeError("login required but no password provided")
     log("login screen detected — signing in")
-    # d.set_input_ime(True)
+    field = password_input(d)
+    # FastInputIME is installed by uiautomator2. Enable it explicitly for this
+    # login, then restore the phone keyboard afterward. send_keys intentionally
+    # hides the IME after each broadcast, so no on-screen ADB keyboard is expected.
+    d.set_input_ime(True)
     time.sleep(0.5)
     # Username: only entered if the login screen actually shows an account field.
     # Normally the app remembers the account, so this is skipped.
@@ -198,12 +221,16 @@ def do_login(d, pwd, username="", log=print):
     #             log("entered username")
     #             break
     # Password: entered every time we hit the login screen.
-    d.xpath('//*[@hint="ລະຫັດຜ່ານ"]').click()
-    d.send_keys("", clear=True)  # ch is undefined
-    
-    for word in pwd:
-        d.send_keys(word, clear=False)  # ch is undefined
-        time.sleep(0.1)
+    try:
+        field.click()
+        d.send_keys("", clear=True)
+        for word in pwd:
+            d.send_keys(word, clear=False)
+            time.sleep(0.1)
+    finally:
+        # Disable only uiautomator2's temporary IME; Android restores the user's
+        # normal keyboard (Samsung Keyboard on this device).
+        d.set_input_ime(False)
 
     d.xpath('//*[@text="ເຂົ້າສູ່ລະບົບ"]').click()
     deadline = time.time() + 45
@@ -512,11 +539,73 @@ def _parse_bounds(bounds):
     return tuple(map(int, match.groups()))
 
 
+def _row_is_incoming(kind, sig, positive_amount):
+    """Classify incoming money while excluding card purchase/sale notices.
+
+    SAL/Mastercard rows can show an unsigned positive amount even though their
+    detail is a card debit or failed purchase ("ເງິນອອກ"). They are not bank
+    transfer income and must never block the incoming-transaction watermark.
+    """
+    if kind == "SAL" or "mastercard" in (sig or "").casefold():
+        return False
+    return "ໄດ້ຮັບ" in (sig or "") or positive_amount
+
+
+def _poll_scroll_limit(last_ref, configured_limit):
+    """Use a deeper, one-time search only while establishing the baseline."""
+    return max(configured_limit, 30) if last_ref is None else configured_limit
+
+
+def _ddmmyyyy(text):
+    match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", text or "")
+    return match.group(1) if match else ""
+
+
+def _message_list_visible(d):
+    """True only for the real Messages list, not detail-shaped full-width nodes."""
+    return (d.xpath('//*[@resource-id="titlecontext"]').exists
+            and bool(_list_rows(d)))
+
+
+def close_message_detail(d, timeout=5, poll=0.2):
+    """Leave a message detail and confirm that the Messages list is restored."""
+    if _message_list_visible(d):
+        return True
+
+    controls = (
+        lambda: d.xpath('//*[@resource-id="titleprev"]'),
+        lambda: d(text="Close"),
+    )
+    for get_control in controls:
+        try:
+            control = get_control()
+            if not control.exists:
+                continue
+            control.click()
+        except Exception:
+            continue
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if _message_list_visible(d):
+                return True
+            time.sleep(poll)
+
+    try:
+        d.press("back")
+    except Exception:
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _message_list_visible(d):
+            return True
+        time.sleep(poll)
+    return _message_list_visible(d)
+
+
 def open_messages_tab(d):
-    # A message *detail* shares the .MainActivity activity and keeps 'My QR' in
-    # the DOM, so go_home/back/tab-taps can't dismiss it — only its Close button
-    # does. Navigate to the Messages tab, then close any lingering detail until
-    # the list (full-width rows) is visible.
+    # A message detail shares the .MainActivity activity and keeps the bottom tabs
+    # in the DOM. Navigate to Messages, then restore the real list if a detail is
+    # still open.
     go_home(d)
     if d(text="ບັດ").exists:
         d(text="ບັດ").click()
@@ -525,14 +614,8 @@ def open_messages_tab(d):
         raise RuntimeError("Messages tab not found")
     d(text="ຂໍ້ຄວາມ").click()
     time.sleep(1.2)
-    for _ in range(3):
-        if _list_rows(d):                 # list is showing
-            return
-        if d(text="Close").exists:        # a detail is open -> close it
-            d(text="Close").click()
-            time.sleep(1.2)
-        else:
-            break
+    if not _message_list_visible(d):
+        close_message_detail(d)
 
 
 def _wait_list_settled(d, timeout=12, poll=0.6):
@@ -552,19 +635,36 @@ def _wait_list_settled(d, timeout=12, poll=0.6):
     return bool(_list_rows(d))
 
 
+def _scroll_messages_to_top(d, max_swipes=30):
+    """Swipe toward newer rows until the visible top row stops changing."""
+    previous_top = None
+    stable_reads = 0
+    for _ in range(max_swipes):
+        rows = _list_rows(d)
+        top = rows[0]["key"] if rows else None
+        if top and top == previous_top:
+            stable_reads += 1
+            if stable_reads >= 2:
+                return True
+        else:
+            stable_reads = 0
+        previous_top = top
+        d.swipe_ext("down", scale=0.8)
+        time.sleep(0.3)
+    return False
+
+
 def refresh_messages(d):
     d.xpath('//*[@resource-id="titlecontext"]').click()   # tap the ↻ refresh icon
     # Wait for the reload to actually land (non-empty + stable) instead of a fixed
     # sleep — on slow internet the fetch can still be in flight after 2s, leaving
     # the list empty/loading and making the poll read nothing.
     _wait_list_settled(d)
-    # Scroll back to the very top so every cycle reads from the NEWEST message.
-    # Without this, a list left scrolled-down from the previous cycle makes the
-    # poll read older transactions (ref != last_ref) as if they were new and keep
-    # scrolling. Swiping "down" reveals content above (newest is first).
-    for _ in range(3):
-        d.swipe_ext("down", scale=0.8)
-        time.sleep(0.3)
+    # Scroll back to the true top so every cycle starts from the NEWEST message.
+    # A fixed number of swipes is unsafe after a deep history scan: the monitor
+    # can otherwise revisit older rows and treat them as new because their ref is
+    # different from the current watermark.
+    _scroll_messages_to_top(d)
     # let the top settle after scrolling before the poll reads it
     _wait_list_settled(d, timeout=4)
 
@@ -643,13 +743,14 @@ def _list_rows(d):
         # used for both incoming and outgoing.
         am = re.search(r"(-?\s*[\d,]+(?:\.\d+)?)\s*(LAK|USD)", sig)
         positive = bool(am) and am.group(1).lstrip()[:1] not in ("-", "−")
-        incoming = ("ໄດ້ຮັບ" in sig) or positive
+        incoming = _row_is_incoming(kind, sig, positive)
         # Stable dedup key from regex-extracted fields (kind + timestamp + amount).
         # Unlike the full sig, this does NOT change when a row is partly clipped at
         # the scroll edge, so an already-clicked message isn't re-opened/re-counted
         # after scrolling.
         tmatch = re.search(r"\b(\d{1,2}:\d{2}:\d{2})\b", sig)
-        key = "|".join((kind, tmatch.group(1) if tmatch else "",
+        timestamp = tmatch.group(1) if tmatch else _ddmmyyyy(sig)
+        key = "|".join((kind, timestamp,
                         am.group(0).strip() if am else ""))
         rows.append({"cy": (y1 + y2) / 2 / h, "center": center, "key": key,
                      "sig": sig, "kind": kind, "incoming": incoming})
@@ -682,11 +783,17 @@ def detail_matches_row(row_sig, rec):
     omitted by one side is allowed for transaction types that do not expose it."""
     ra = _amount_value(row_sig)
     da = _amount_value(rec.get("amount_in") or rec.get("amount") or "")
-    rt, dt = _hhmmss(row_sig), _hhmmss(rec.get("time") or "")
+    detail_time = rec.get("time") or ""
+    rt, dt = _hhmmss(row_sig), _hhmmss(detail_time)
     if ra is None or da is None or ra != da:
         return False                      # absent/conflicting amount -> incomplete/wrong
-    if not rt or not dt or rt != dt:
-        return False                      # absent/conflicting time -> incomplete/wrong
+    if rt:
+        if not dt or rt != dt:
+            return False                  # present time must agree exactly
+    else:
+        rd, dd = _ddmmyyyy(row_sig), _ddmmyyyy(detail_time)
+        if not rd or not dd or rd != dd:
+            return False                  # older rows expose only the transaction date
 
     row_account, row_name = row_source(row_sig)
     detail_account, detail_name = detail_source(rec)
@@ -735,12 +842,9 @@ def _read_verified_detail(d, row, log=print):
                         break
                 else:
                     stable_fingerprint, stable_reads = None, 0
-        if opened:                                # close the detail we opened
-            try:
-                d(text="Close").click()
-            except Exception:
-                d.press("back")
-            time.sleep(0.6)
+        if opened and not close_message_detail(d):
+            log("⚠ detail close failed — message list was not restored")
+            return None
         if rec:
             # Preserve the exact row snapshot used for verification. The list may
             # have refreshed since the row was first selected.
@@ -760,7 +864,8 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
       - Classifies each list row as incoming/outgoing (received title or positive
         amount); only *incoming* rows are opened to read their detail/reference.
       - first run (last_ref is None): SAFEGUARD — records ONLY the newest incoming
-        ref as the baseline and stops. It does not scroll and sends nothing.
+        ref as the baseline and stops. It may scroll past card/outgoing rows to find
+        that first incoming row, but sends nothing.
       - later runs: reads top->bottom, collecting new incoming until it reaches a
         ref == last_ref (which it stops at and excludes); updates last_ref to the
         newest incoming ref.
@@ -779,6 +884,10 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
     done_refs = set()      # detail refs already collected — guards double-send
     new, new_top = [], None
     scrolls = 0
+    # A newly-added account may have many SAL/Mastercard notices above its newest
+    # actual incoming transfer. Search deeper only while establishing the no-send
+    # baseline; normal incremental polls keep the caller's smaller scroll limit.
+    scroll_limit = _poll_scroll_limit(last_ref, max_scrolls)
     matched = False
     blocked = False        # an incoming row could not be verified; hold old watermark
     guard = 0
@@ -787,11 +896,7 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         rows = _list_rows(d)
         nextrow = next((r for r in rows if r["key"] not in seen), None)
         if nextrow is None:                       # nothing new on screen
-            # SAFEGUARD: on first run (no watermark) never scroll — we only need
-            # the newest incoming to set the baseline.
-            if last_ref is None:
-                break
-            if scrolls >= max_scrolls:
+            if scrolls >= scroll_limit:
                 break
             d.swipe_ext("up", scale=0.7)
             time.sleep(1.2)
@@ -843,6 +948,13 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
             break
         # otherwise it's new -> collect it
         new.append(rec)
+
+    if last_ref is not None and not matched and not blocked:
+        # A deliberately invalid/manual watermark is used as a one-time override:
+        # verified candidates continue to the gateway, and a successful send moves
+        # the boundary to the newest real reference. The caller's send-success gate
+        # still prevents advancement on transient gateway failures.
+        log(f"⚠ watermark {last_ref} was not found — continuing with {len(new)} verified candidate(s)")
 
     return {"first_run": last_ref is None,
             "last_ref": last_ref if blocked else (new_top or last_ref),
