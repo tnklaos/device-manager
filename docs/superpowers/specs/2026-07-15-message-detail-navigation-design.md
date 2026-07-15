@@ -15,7 +15,9 @@ Add a focused `close_message_detail(d)` helper in `bcel.py`. It will:
 1. Prefer the version-stable WebView control with resource id `titleprev`.
 2. Retain the legacy `Close` text control as a compatibility fallback.
 3. Use Android Back only as a final fallback.
-4. Wait for `_list_rows(d)` to become non-empty before reporting success.
+4. Wait for the Messages-list refresh control (`titlecontext`) and real list rows
+   before reporting success. Detail content can otherwise resemble full-width
+   list rows and create a false positive.
 5. Return a boolean so callers can distinguish a restored list from a failed
    navigation attempt.
 
