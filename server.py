@@ -68,7 +68,7 @@ def set_log_retention():
     return jsonify(eng.set_log_retention(b.get("value")))
 
 
-# ---------- setting sets (named gateway profiles) ----------
+# ---------- setting sets (named delivery profiles) ----------
 @app.get("/api/sets")
 def get_sets():
     return jsonify(eng.sets())
@@ -77,8 +77,16 @@ def get_sets():
 @app.post("/api/sets")
 def save_set():
     b = request.get_json(force=True, silent=True) or {}
-    set_id = eng.save_set(b.get("id"), b.get("name", ""), b.get("client_id", ""),
-                          b.get("secret_key", ""), b.get("api_url", ""))
+    try:
+        set_id = eng.save_set(
+            b.get("id"), b.get("name", ""), b.get("client_id", ""),
+            b.get("secret_key", ""), b.get("api_url", ""),
+            set_type=b.get("type", "gateway"),
+            header=b.get("header", ""),
+            callback_url=b.get("callback_url", ""),
+        )
+    except ValueError as error:
+        return jsonify(ok=False, message=str(error)), 400
     return jsonify(ok=True, id=set_id)
 
 

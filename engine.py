@@ -13,9 +13,12 @@ import queue
 import threading
 import subprocess
 import collections
+import re
+from urllib.parse import urlparse
 
 import bcel
 import csl_client
+import custom_client
 
 import sys
 
@@ -43,7 +46,7 @@ else:
     SETTINGS_FILE = os.path.join(HERE, "settings.json")
     TRANSACTIONS_FILE = os.path.join(HERE, "transactions.json")
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 MONITOR_INTERVAL = 60
 DEFAULT_LOG_RETENTION = "7_days"
 LOG_RETENTION_DAYS = {
@@ -64,6 +67,7 @@ FRESH_RESTART_CYCLES = 30
 # monitor — lets a brief Wi-Fi/internet drop recover instead of killing it.
 OFFLINE_TOLERANCE = 3
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 
 def load_settings():
@@ -299,33 +303,74 @@ class Engine:
         removed = self._prune_transactions()
         return {"ok": True, "log_retention": value, "removed": removed}
 
-    # ---------- setting sets (named gateway profiles) ----------
+    # ---------- setting sets (named delivery profiles) ----------
     def sets(self):
-        """All gateway profiles (secrets redacted to a has_secret flag)."""
+        """All delivery profiles, with API keys redacted."""
         out = []
         for sid, s in self.settings.get("sets", {}).items():
-            out.append({
+            set_type = s.get("type") if s.get("type") in ("gateway", "custom") else "gateway"
+            item = {
                 "id": sid,
                 "name": s.get("name", ""),
-                "client_id": s.get("client_id", ""),
+                "type": set_type,
                 "has_secret": bool(s.get("api_key")),
-                "api_url": s.get("api_url", "") or GATEWAY_API_URL,
-            })
+            }
+            if set_type == "custom":
+                item.update({
+                    "header": s.get("header", ""),
+                    "callback_url": s.get("callback_url", ""),
+                })
+            else:
+                item.update({
+                    "client_id": s.get("client_id", ""),
+                    "api_url": s.get("api_url", "") or GATEWAY_API_URL,
+                })
+            out.append(item)
         return out
 
-    def save_set(self, set_id, name, client_id, secret, api_url):
-        """Create (blank set_id) or update a gateway profile. Returns its id.
-        A blank secret on update keeps the stored one."""
+    def save_set(self, set_id, name, client_id, secret, api_url,
+                 set_type="gateway", header="", callback_url=""):
+        """Create or update a gateway/custom delivery profile."""
+        set_type = (set_type or "gateway").strip().lower()
+        if set_type not in ("gateway", "custom"):
+            raise ValueError("Invalid set type")
+
+        name = (name or "").strip()
+        header = (header or "").strip()
+        callback_url = (callback_url or "").strip()
+        if set_type == "custom":
+            if not name:
+                raise ValueError("Name is required")
+            if not header or not _HEADER_NAME_RE.fullmatch(header):
+                raise ValueError("Header must be a valid HTTP header name")
+            parsed = urlparse(callback_url)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise ValueError("Callback URL must be a valid HTTP or HTTPS URL")
+
         with self._slock:
             sets = self.settings.setdefault("sets", {})
+            existing = sets.get(set_id, {}) if set_id else {}
+            saved_secret = (existing.get("api_key") or "").strip()
+            new_secret = (secret or "").strip()
+            if set_type == "custom" and not (new_secret or saved_secret):
+                raise ValueError("API-KEY is required")
             if not set_id:
                 set_id = uuid.uuid4().hex[:8]
-            s = sets.setdefault(set_id, {})
-            s["name"] = (name or s.get("name") or "Untitled").strip()
-            s["client_id"] = (client_id or "").strip()
-            if secret:
-                s["api_key"] = secret.strip()
-            s["api_url"] = (api_url or "").strip()
+            s = {"type": set_type, "name": name or existing.get("name") or "Untitled"}
+            if new_secret:
+                s["api_key"] = new_secret
+            elif saved_secret:
+                s["api_key"] = saved_secret
+            if set_type == "custom":
+                s.update({"header": header, "callback_url": callback_url})
+            else:
+                s.update({
+                    "client_id": (client_id or "").strip(),
+                    "api_url": (api_url or "").strip(),
+                })
+                if existing.get("webhook"):
+                    s["webhook"] = existing["webhook"]
+            sets[set_id] = s
             save_settings(self.settings)
         return set_id
 
@@ -360,6 +405,8 @@ class Engine:
         s = self.settings.get("sets", {}).get(set_id)
         if not s:
             return {"ok": False, "message": "Set not found"}
+        if s.get("type") == "custom":
+            return {"ok": False, "message": "Custom sets do not use gateway webhook registration"}
         cid = (s.get("client_id") or "").strip()
         key = (s.get("api_key") or "").strip()
         if not (cid and key):
@@ -674,9 +721,6 @@ class Engine:
 
     def _send(self, serial, new):
         s = self.device_set(serial)
-        cid = (s.get("client_id") or "").strip() if s else ""
-        key = (s.get("api_key") or "").strip() if s else ""
-        api_url = ((s.get("api_url") or "").strip() if s else "") or GATEWAY_API_URL
         txns = [{**t, "serial": serial} for t in new]
         # GLOBAL duplicate guard: drop any transaction whose reference was already
         # posted (by this device on an earlier cycle, after a fresh restart, or by
@@ -709,11 +753,36 @@ class Engine:
         if not s:
             self.log(f"⚠ {serial}: no setting set assigned — held (assign one on the device card)")
             return False
-        if not (cid and key):
-            self.log(f"⚠ {serial}: set '{s.get('name')}' is missing credentials — held")
-            return False
+        set_type = s.get("type") if s.get("type") in ("gateway", "custom") else "gateway"
+        key = (s.get("api_key") or "").strip()
         try:
-            ok, msg, transient = csl_client.post_transactions(api_url, cid, key, txns, timeout=10)
+            if set_type == "custom":
+                header = (s.get("header") or "").strip()
+                callback_url = (s.get("callback_url") or "").strip()
+                if not (header and key and callback_url):
+                    self.log(f"⚠ {serial}: custom set '{s.get('name')}' is incomplete — held")
+                    return False
+                custom_txns = []
+                for t in txns:
+                    from_acct, from_name = source_account(t)
+                    custom_txns.append({
+                        **t,
+                        "from_account": from_acct,
+                        "from_name": from_name,
+                        "to_account": t.get("to_account") or t.get("account") or "",
+                    })
+                ok, msg, transient = custom_client.post_transactions(
+                    callback_url, header, key, custom_txns, timeout=10
+                )
+            else:
+                cid = (s.get("client_id") or "").strip()
+                api_url = (s.get("api_url") or "").strip() or GATEWAY_API_URL
+                if not (cid and key):
+                    self.log(f"⚠ {serial}: set '{s.get('name')}' is missing credentials — held")
+                    return False
+                ok, msg, transient = csl_client.post_transactions(
+                    api_url, cid, key, txns, timeout=10
+                )
             self.log(f"→ {serial}: synced {len(txns)} transaction(s): {msg}")
             if ok:
                 # remember these references so they can never be posted again
@@ -747,10 +816,10 @@ class Engine:
                 for rec in added:
                     self.emit("transaction", rec)
                 return True
-            # gateway reachable but rejected the batch (4xx) -> advance so one bad
-            # record can't block everything; a transient/5xx/network error -> retry.
+            # Endpoint reachable but rejected the batch (4xx) -> advance so one
+            # bad record cannot block everything; network/5xx errors are retried.
             if transient:
-                self.log(f"↻ {serial}: gateway unreachable — will retry next cycle")
+                self.log(f"↻ {serial}: delivery endpoint unavailable — will retry next cycle")
                 return False
             return True
         except Exception as e:
