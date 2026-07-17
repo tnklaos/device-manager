@@ -32,6 +32,20 @@ class _DateOnlyHierarchyDevice:
         </hierarchy>"""
 
 
+class _ThbHierarchyDevice:
+    info = {"displayWidth": 1080, "displayHeight": 2400}
+
+    def dump_hierarchy(self):
+        return """<hierarchy>
+          <node scrollable="true" bounds="[0,200][1080,2100]" />
+          <node clickable="true" bounds="[0,300][1080,700]" />
+          <node text="TRI" bounds="[20,320][120,380]" />
+          <node text="10:15:22" bounds="[150,320][350,380]" />
+          <node text="ຈາກບັນຊີ: PHON - 02012345678" bounds="[20,430][850,500]" />
+          <node text="1,500.00 THB" bounds="[700,580][1040,650]" />
+        </hierarchy>"""
+
+
 class DetailSourceTests(unittest.TestCase):
     def test_list_snapshot_does_not_invent_qr_pipe_delimiters(self):
         rows = bcel._list_rows(_HierarchyDevice())
@@ -73,6 +87,11 @@ class IncomingClassificationTests(unittest.TestCase):
         sig = "ACC\nໄດ້ຮັບເງິນ\n50,000 LAK"
         self.assertTrue(bcel._row_is_incoming("ACC", sig, positive_amount=True))
 
+    def test_positive_thb_row_is_incoming_and_keeps_currency_in_key(self):
+        row = bcel._list_rows(_ThbHierarchyDevice())[0]
+        self.assertTrue(row["incoming"])
+        self.assertEqual(row["key"], "TRI|10:15:22|1,500.00 THB")
+
 
 class DetailMatchTests(unittest.TestCase):
     def setUp(self):
@@ -105,6 +124,16 @@ class DetailMatchTests(unittest.TestCase):
     def test_different_amount_is_rejected(self):
         wrong = {**self.rec, "amount_in": "100,000.00 LAK"}
         self.assertFalse(bcel.detail_matches_row(self.row, wrong))
+
+    def test_matching_thb_transaction_is_accepted(self):
+        thb_row = self.row.replace("50,000 LAK", "1,500 THB")
+        thb_rec = {**self.rec, "amount_in": "1,500.00 THB"}
+        self.assertTrue(bcel.detail_matches_row(thb_row, thb_rec))
+
+    def test_equal_values_with_different_currencies_are_rejected(self):
+        usd_row = self.row.replace("50,000 LAK", "1,500 USD")
+        thb_rec = {**self.rec, "amount_in": "1,500.00 THB"}
+        self.assertFalse(bcel.detail_matches_row(usd_row, thb_rec))
 
     def test_masked_account_does_not_create_false_conflict(self):
         masked_row = self.row.replace("02012345678", "xxx-x-5678")

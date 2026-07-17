@@ -16,6 +16,7 @@ import re
 import time
 import subprocess
 import xml.etree.ElementTree as ET
+from decimal import Decimal, InvalidOperation
 import uiautomator2 as u2
 
 PKG = "com.bcel.bcelone"
@@ -384,6 +385,8 @@ def create_qr(serial, amount, description, password="", username="", submit=True
 
 _MSG_LABELS = {"ຫາບັນຊີ": "to_account", "ລາຍລະອຽດ": "details", "ເລກໃບບິນ": "bill_no",
                "ເງິນອອກ": "amount_out", "ເງິນເຂົ້າ": "amount_in", "ຈຳນວນເງິນ": "amount"}
+_AMOUNT_TOKEN = r"([−-]?\s*[\d,]+(?:\.\d+)?)\s*([A-Z]{3})\b"
+_AMOUNT_RE = re.compile(_AMOUNT_TOKEN)
 
 
 def row_source(sig):
@@ -399,7 +402,7 @@ def row_source(sig):
         # take the |-joined run, dropping any leading "...Account <own> " prefix
         tail = re.split(r"\bAccount\s+[\dxX][\dxX\-]+\s+", sig, maxsplit=1)
         tail = tail[-1]
-        tail = re.sub(r"(-?\s*[\d,]+(?:\.\d+)?)\s*(LAK|USD).*$", "", tail).strip()
+        tail = re.sub(rf"{_AMOUNT_TOKEN}.*$", "", tail).strip()
         parts = [p.strip() for p in tail.split("|")]
         ttype = parts[0].upper().replace(" ", "") if parts else ""
         idx = 5 if "ONEPAY" in ttype else 2
@@ -407,7 +410,7 @@ def row_source(sig):
                (parts[5] if len(parts) > 5 else "")
     mf = re.search(
         r"ຈາກບັນຊີ:\s*(.*?)\s*"
-        r"(?=-?\s*[\d,]+(?:\.\d+)?\s*(?:LAK|USD)|ລາຍລະອຽດ:|"
+        rf"(?={_AMOUNT_TOKEN}|ລາຍລະອຽດ:|"
         r"ຫາບັນຊີ:|ເລກອ້າງອິງ:|ເລກໃບບິນ:|$)",
         sig,
     )
@@ -741,7 +744,7 @@ def _list_rows(d):
         # This catches BOTH transfers-in (TRI, ໄດ້ຮັບເງິນໂອນ) and QR/LMPS
         # payments-in (ACC, ໄດ້ຮັບເງິນ) — kind alone is not enough since ACC is
         # used for both incoming and outgoing.
-        am = re.search(r"(-?\s*[\d,]+(?:\.\d+)?)\s*(LAK|USD)", sig)
+        am = _AMOUNT_RE.search(sig)
         positive = bool(am) and am.group(1).lstrip()[:1] not in ("-", "−")
         incoming = _row_is_incoming(kind, sig, positive)
         # Stable dedup key from regex-extracted fields (kind + timestamp + amount).
@@ -757,15 +760,15 @@ def _list_rows(d):
     return rows
 
 
-def _amount_value(text):
-    """Numeric value of an amount, ignoring formatting. The list shows '2,000 LAK'
-    while the detail shows '2,000.00 LAK' — both normalize to 2000.0."""
-    m = re.search(r"(-?\s*[\d,]+(?:\.\d+)?)\s*(?:LAK|USD)", text or "")
+def _amount_identity(text):
+    """Exact numeric value and currency used to match a row to its detail."""
+    m = _AMOUNT_RE.search(text or "")
     if not m:
         return None
     try:
-        return float(m.group(1).replace(",", "").replace(" ", ""))
-    except ValueError:
+        number = m.group(1).replace(",", "").replace(" ", "").replace("−", "-")
+        return Decimal(number), m.group(2)
+    except InvalidOperation:
         return None
 
 
@@ -781,8 +784,8 @@ def detail_matches_row(row_sig, rec):
     WebView record combine the new transaction's ref/amount with the previous
     transaction's sender. Sender/account conflicts are also rejected, but a source
     omitted by one side is allowed for transaction types that do not expose it."""
-    ra = _amount_value(row_sig)
-    da = _amount_value(rec.get("amount_in") or rec.get("amount") or "")
+    ra = _amount_identity(row_sig)
+    da = _amount_identity(rec.get("amount_in") or rec.get("amount") or "")
     detail_time = rec.get("time") or ""
     rt, dt = _hhmmss(row_sig), _hhmmss(detail_time)
     if ra is None or da is None or ra != da:
