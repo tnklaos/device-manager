@@ -26,25 +26,25 @@
 - Consumes: existing type-aware set objects returned by `/api/sets`.
 - Produces: settings tabs without a `new-custom` creation route.
 
-- [ ] **Step 1: Write the failing renderer contract test**
+- [x] **Step 1: Write the failing renderer contract test**
 
 Replace the creation-button assertions with assertions that `new-custom`,
 `data-set="new-custom"`, and `＋ Custom Set` are absent, while `set-header`,
 `set-api-key`, `set-callback`, and the `setType === "custom"` save branch remain.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `./venv/bin/python -m unittest tests.test_custom_set_ui -v`
 
 Expected: FAIL because `app.js` still contains the custom creation route/button.
 
-- [ ] **Step 3: Remove the renderer route**
+- [x] **Step 3: Remove the renderer route**
 
 Remove `new-custom` from valid tab state, delete the `＋ Custom Set` tab HTML,
 and make all new profiles default to `gateway`. Retain existing-profile type
 handling so saved custom profiles still render and save correctly.
 
-- [ ] **Step 4: Verify GREEN and regressions**
+- [x] **Step 4: Verify GREEN and regressions**
 
 Run: `./venv/bin/python -m unittest tests.test_custom_set_ui -v`
 
@@ -52,7 +52,7 @@ Run: `./venv/bin/python -m unittest discover -s tests -v`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Verify runtime**
+- [x] **Step 5: Verify runtime**
 
 Run: `node --check electron/renderer/app.js && git diff --check`
 
