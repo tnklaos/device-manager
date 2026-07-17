@@ -173,7 +173,7 @@ $("#tx-clear").onclick = async () => {
 
 // ---------- settings: delivery sets ----------
 let sets = [];
-let activeSetId = "sync";          // set id, "new", "new-custom", "logs", or "sync"
+let activeSetId = "sync";          // set id, "new", "logs", or "sync"
 let defaultApi = "https://paymentgateway.108pay.co";
 let logRetention = "7_days";
 const logRetentionDays = {
@@ -192,7 +192,7 @@ async function loadSettings() {
 
 async function loadSets() {
 	sets = await api("/api/sets");
-	if (!["sync", "logs", "new", "new-custom"].includes(activeSetId) && !sets.find((x) => x.id === activeSetId))
+	if (!["sync", "logs", "new"].includes(activeSetId) && !sets.find((x) => x.id === activeSetId))
 		activeSetId = sets.length ? sets[0].id : "new";
 	renderSetTabs();
 	renderSetEditor();
@@ -205,7 +205,6 @@ function renderSetTabs() {
 		`<button class="settab ${activeSetId === s.id ? "active" : ""}" data-set="${s.id}">${esc(s.name || "Untitled")}</button>`
 	).join("");
 	html += `<button class="settab add ${activeSetId === "new" ? "active" : ""}" data-set="new">＋ Add set</button>`;
-	html += `<button class="settab add ${activeSetId === "new-custom" ? "active" : ""}" data-set="new-custom">＋ Custom Set</button>`;
 	html += `<button class="settab ${activeSetId === "logs" ? "active" : ""}" data-set="logs" style="margin-left:auto">Logs</button>`;
 	html += `<button class="settab ${activeSetId === "sync" ? "active" : ""}" data-set="sync">Sync</button>`;
 	bar.innerHTML = html;
@@ -224,7 +223,7 @@ function renderSetEditor() {
 	if (isLogs) { $("#log-retention").value = logRetention; return; }
 	const s = sets.find((x) => x.id === activeSetId);
 	const isNew = !s;
-	const setType = s ? (s.type || "gateway") : (activeSetId === "new-custom" ? "custom" : "gateway");
+	const setType = s ? (s.type || "gateway") : "gateway";
 	const isCustom = setType === "custom";
 	$("#set-editor-title").textContent = isNew
 		? (isCustom ? "New custom set" : "New gateway set")
@@ -266,7 +265,7 @@ $("#set-save").onclick = async () => {
 	$("#set-status").textContent = "Saving…";
 	const existing = sets.find((x) => x.id === activeSetId);
 	const isNew = !existing;
-	const setType = existing ? (existing.type || "gateway") : (activeSetId === "new-custom" ? "custom" : "gateway");
+	const setType = existing ? (existing.type || "gateway") : "gateway";
 	const body = {
 		id: isNew ? "" : activeSetId,
 		type: setType,

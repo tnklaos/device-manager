@@ -13,11 +13,11 @@ class CustomSetUIContractTests(unittest.TestCase):
         with open(os.path.join(ROOT, "electron", "renderer", "app.js")) as file:
             cls.js = file.read()
 
-    def test_custom_set_tab_and_fields_exist(self):
-        for token in (
-            "new-custom", "＋ Custom Set", "set-header", "set-api-key",
-            "set-callback",
-        ):
+    def test_custom_set_creation_is_hidden_but_editor_fields_remain(self):
+        self.assertNotIn("new-custom", self.js)
+        self.assertNotIn('data-set="new-custom"', self.js)
+        self.assertNotIn("＋ Custom Set", self.js)
+        for token in ("set-header", "set-api-key", "set-callback"):
             with self.subTest(token=token):
                 self.assertIn(token, self.html + self.js)
 
