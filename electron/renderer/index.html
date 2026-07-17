@@ -73,7 +73,7 @@
       </section>
 
       <section id="view-settings" class="view hidden">
-        <!-- tabbed items: one tab per gateway set, plus global Sync -->
+        <!-- tabbed items: one tab per delivery set, plus global Sync -->
         <div class="settabs" id="settabs"></div>
 
         <!-- a set's editor -->
@@ -82,13 +82,23 @@
             <h2 id="set-editor-title">Gateway Set</h2>
             <button id="set-delete" class="btn red sm" title="Delete this set">Delete</button>
           </div>
-          <p class="muted">A named gateway profile. Assign devices to it on the Devices page.</p>
+          <p id="set-description" class="muted">A named gateway profile. Assign devices to it on the Devices page.</p>
           <label>Set name</label>
           <input id="set-name" type="text" placeholder="e.g. Client A" />
-          <label>Client ID</label>
-          <input id="set-client" type="text" placeholder="client id" />
-          <label>Secret Key</label>
-          <input id="set-secret" type="password" placeholder="secret key" />
+          <div id="gateway-set-fields">
+            <label>Client ID</label>
+            <input id="set-client" type="text" placeholder="client id" />
+            <label>Secret Key</label>
+            <input id="set-secret" type="password" placeholder="secret key" />
+          </div>
+          <div id="custom-set-fields" class="hidden">
+            <label>Header</label>
+            <input id="set-header" type="text" placeholder="e.g. X-API-Key" />
+            <label>API-KEY</label>
+            <input id="set-api-key" type="password" placeholder="API key" />
+            <label>Callback URL</label>
+            <input id="set-callback" type="url" placeholder="https://client.example.com/transactions" />
+          </div>
           <div class="row-actions">
             <button id="set-save" class="btn primary">Save</button>
             <button id="set-register" class="btn ghost">Register webhook</button>

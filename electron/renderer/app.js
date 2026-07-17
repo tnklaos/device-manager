@@ -171,9 +171,9 @@ $("#tx-clear").onclick = async () => {
 	renderTransactions();
 };
 
-// ---------- settings: gateway sets ----------
+// ---------- settings: delivery sets ----------
 let sets = [];
-let activeSetId = "sync";          // tab selection: a set id, "new", or "sync"
+let activeSetId = "sync";          // set id, "new", "new-custom", "logs", or "sync"
 let defaultApi = "https://paymentgateway.108pay.co";
 let logRetention = "7_days";
 const logRetentionDays = {
@@ -192,7 +192,7 @@ async function loadSettings() {
 
 async function loadSets() {
 	sets = await api("/api/sets");
-	if (!["sync", "logs", "new"].includes(activeSetId) && !sets.find((x) => x.id === activeSetId))
+	if (!["sync", "logs", "new", "new-custom"].includes(activeSetId) && !sets.find((x) => x.id === activeSetId))
 		activeSetId = sets.length ? sets[0].id : "new";
 	renderSetTabs();
 	renderSetEditor();
@@ -205,6 +205,7 @@ function renderSetTabs() {
 		`<button class="settab ${activeSetId === s.id ? "active" : ""}" data-set="${s.id}">${esc(s.name || "Untitled")}</button>`
 	).join("");
 	html += `<button class="settab add ${activeSetId === "new" ? "active" : ""}" data-set="new">＋ Add set</button>`;
+	html += `<button class="settab add ${activeSetId === "new-custom" ? "active" : ""}" data-set="new-custom">＋ Custom Set</button>`;
 	html += `<button class="settab ${activeSetId === "logs" ? "active" : ""}" data-set="logs" style="margin-left:auto">Logs</button>`;
 	html += `<button class="settab ${activeSetId === "sync" ? "active" : ""}" data-set="sync">Sync</button>`;
 	bar.innerHTML = html;
@@ -223,12 +224,26 @@ function renderSetEditor() {
 	if (isLogs) { $("#log-retention").value = logRetention; return; }
 	const s = sets.find((x) => x.id === activeSetId);
 	const isNew = !s;
-	$("#set-editor-title").textContent = isNew ? "New gateway set" : (s.name || "Gateway set");
+	const setType = s ? (s.type || "gateway") : (activeSetId === "new-custom" ? "custom" : "gateway");
+	const isCustom = setType === "custom";
+	$("#set-editor-title").textContent = isNew
+		? (isCustom ? "New custom set" : "New gateway set")
+		: (s.name || (isCustom ? "Custom set" : "Gateway set"));
+	$("#set-description").textContent = isCustom
+		? "Forward transactions directly to your callback with the configured API-key header."
+		: "A named gateway profile. Assign devices to it on the Devices page.";
 	$("#set-name").value = isNew ? "" : (s.name || "");
+	$("#gateway-set-fields").classList.toggle("hidden", isCustom);
+	$("#custom-set-fields").classList.toggle("hidden", !isCustom);
 	$("#set-client").value = isNew ? "" : (s.client_id || "");
 	$("#set-secret").value = "";
 	$("#set-secret").placeholder = (!isNew && s.has_secret) ? "•••••• (saved — blank keeps it)" : "secret key";
+	$("#set-header").value = isNew ? "" : (s.header || "");
+	$("#set-api-key").value = "";
+	$("#set-api-key").placeholder = (!isNew && s.has_secret) ? "•••••• (saved — blank keeps it)" : "API key";
+	$("#set-callback").value = isNew ? "" : (s.callback_url || "");
 	$("#set-delete").style.display = isNew ? "none" : "";
+	$("#set-register").classList.toggle("hidden", isCustom);
 	$("#set-status").textContent = "";
 }
 
@@ -249,14 +264,34 @@ $("#log-retention").onchange = async (event) => {
 
 $("#set-save").onclick = async () => {
 	$("#set-status").textContent = "Saving…";
-	const isNew = !sets.find((x) => x.id === activeSetId);
-	const r = await post("/api/sets", {
+	const existing = sets.find((x) => x.id === activeSetId);
+	const isNew = !existing;
+	const setType = existing ? (existing.type || "gateway") : (activeSetId === "new-custom" ? "custom" : "gateway");
+	const body = {
 		id: isNew ? "" : activeSetId,
+		type: setType,
 		name: $("#set-name").value.trim(),
-		client_id: $("#set-client").value.trim(),
-		secret_key: $("#set-secret").value.trim(),
-	});
+	};
+	if (setType === "custom") {
+		body.header = $("#set-header").value.trim();
+		body.secret_key = $("#set-api-key").value.trim();
+		body.callback_url = $("#set-callback").value.trim();
+	} else {
+		body.client_id = $("#set-client").value.trim();
+		body.secret_key = $("#set-secret").value.trim();
+	}
+	const r = await post("/api/sets", body);
+	if (!r.ok) {
+		$("#set-status").textContent = "⚠ " + (r.message || "Could not save set");
+		return;
+	}
 	if (r.id) activeSetId = r.id;
+	if (setType === "custom") {
+		await loadSets();
+		$("#set-status").textContent = "Saved ✓";
+		setTimeout(() => ($("#set-status").textContent = ""), 5000);
+		return;
+	}
 	// verify the credentials against the gateway (POST /bcel/setup)
 	$("#set-status").textContent = "Saved — verifying credentials…";
 	const v = await post(`/api/sets/${activeSetId}/webhook`);
