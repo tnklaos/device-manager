@@ -27,13 +27,6 @@
       "client_id": "894019c1-1289-47d5-a74d-105127505752",
       "api_key": "05790f1d-fd58-4652-9c08-cddf9438c1e4",
       "api_url": ""
-    },
-    "5f0473a3": {
-      "type": "custom",
-      "name": "FF",
-      "api_key": "FF",
-      "header": "FF",
-      "callback_url": "https://betwithme.vip/callback"
     }
   },
   "sent_refs": [

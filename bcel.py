@@ -217,43 +217,65 @@ def at_login(d):
     return d(resourceId="login").exists
 
 
+def enter_password(d, field, pwd, log=print):
+    """Type the password into `field`, trying input methods in order of preference
+    and falling through on failure. The device's IME support varies:
+
+    1. FastInputIME (AdbKeyboard) — fast and hides the on-screen keyboard, and some
+       Android 16 / WebView builds only accept text through it. But installing it
+       is blocked on some OEM/locked-down builds, where set_input_ime() raises
+       "install AdbKeyboard ime failed".
+    2. Plain d.send_keys() — u2's own graceful path: it uses the accessibility
+       set_text when the IME isn't installed. This is what worked before the
+       explicit set_input_ime() was added, so it's the key regression-proof step.
+    3. `adb shell input text` — types via whatever keyboard is active, no special
+       IME at all. Last-resort for WebView fields that reject set_text.
+
+    Whichever succeeds first wins; only if ALL fail do we raise.
+    """
+    def _via_fastime():
+        d.set_input_ime(True)
+        time.sleep(0.5)
+        try:
+            d.send_keys("", clear=True)
+            for ch in pwd:
+                d.send_keys(ch, clear=False)
+                time.sleep(0.1)
+        finally:
+            try:
+                d.set_input_ime(False)
+            except Exception:
+                pass
+
+    def _via_sendkeys():
+        d.send_keys("", clear=True)
+        for ch in pwd:
+            d.send_keys(ch, clear=False)
+            time.sleep(0.1)
+
+    def _via_inputtext():
+        clear_field(d)
+        type_via_input(d, pwd)
+
+    last_err = None
+    for strat in (_via_fastime, _via_sendkeys, _via_inputtext):
+        try:
+            field.click()
+            time.sleep(0.3)
+            strat()
+            return strat.__name__
+        except Exception as e:
+            last_err = e
+            log(f"⚠ password entry via {strat.__name__} failed ({e}) — trying next method")
+    raise RuntimeError(f"could not enter password by any input method: {last_err}")
+
+
 def do_login(d, pwd, username="", log=print):
     if not pwd:
         raise RuntimeError("login required but no password provided")
     log("login screen detected — signing in")
     field = password_input(d)
-    # Prefer uiautomator2's FastInputIME (fast, hides the on-screen keyboard). But
-    # some devices (MIUI/Vivo/Oppo, locked-down builds) refuse to enable/set a
-    # third-party IME, and set_input_ime() then raises — which used to abort login
-    # entirely. Treat the special IME as OPTIONAL and fall back to `input text`,
-    # which types via the device's own keyboard and needs no IME at all.
-    ime_ok = False
-    try:
-        d.set_input_ime(True)
-        time.sleep(0.5)
-        ime_ok = True
-    except Exception as e:
-        log(f"⚠ FastInputIME unavailable on this device ({e}) — using input-text fallback")
-    # Password: entered every time we hit the login screen.
-    try:
-        field.click()
-        time.sleep(0.3)
-        if ime_ok:
-            d.send_keys("", clear=True)
-            for word in pwd:
-                d.send_keys(word, clear=False)
-                time.sleep(0.1)
-        else:
-            clear_field(d)
-            type_via_input(d, pwd)
-    finally:
-        # Restore the user's normal keyboard. Only meaningful (and only works) if
-        # we actually enabled FastInputIME; guard it so a failed enable can't throw.
-        if ime_ok:
-            try:
-                d.set_input_ime(False)
-            except Exception:
-                pass
+    enter_password(d, field, pwd, log=log)
 
     d.xpath('//*[@text="ເຂົ້າສູ່ລະບົບ"]').click()
     deadline = time.time() + 45
