@@ -46,7 +46,7 @@ else:
     SETTINGS_FILE = os.path.join(HERE, "settings.json")
     TRANSACTIONS_FILE = os.path.join(HERE, "transactions.json")
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 MONITOR_INTERVAL = 60
 DEFAULT_LOG_RETENTION = "7_days"
 LOG_RETENTION_DAYS = {

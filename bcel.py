@@ -112,6 +112,23 @@ def clear_and_type(d, value, n=16):
     d.send_keys(str(value))
 
 
+def clear_field(d, n=16):
+    """Clear the focused field: jump to end, then backspace n times."""
+    d.shell("input keyevent 123 " + ("67 " * n))
+
+
+def type_via_input(d, value, per_char_delay=0.1):
+    """Type into the FOCUSED field using the device's own keyboard via
+    `adb shell input text`, one character at a time. This needs NO special IME —
+    it's the fallback for devices where FastInputIME can't be enabled (some
+    MIUI/Vivo/Oppo and locked-down Android builds). The list form of d.shell
+    avoids shell-escaping issues; space is the one char `input text` treats
+    specially (encoded as %s)."""
+    for ch in str(value):
+        d.shell(["input", "text", "%s" if ch == " " else ch])
+        time.sleep(per_char_delay)
+
+
 def fill(d, xy, value, passes=1):
     """Focus a custom input box, clear, then type. Pass passes=2 for the first
     field after a page load (its input can be swallowed while the IME attaches)."""
@@ -205,33 +222,38 @@ def do_login(d, pwd, username="", log=print):
         raise RuntimeError("login required but no password provided")
     log("login screen detected — signing in")
     field = password_input(d)
-    # FastInputIME is installed by uiautomator2. Enable it explicitly for this
-    # login, then restore the phone keyboard afterward. send_keys intentionally
-    # hides the IME after each broadcast, so no on-screen ADB keyboard is expected.
-    d.set_input_ime(True)
-    time.sleep(0.5)
-    # Username: only entered if the login screen actually shows an account field.
-    # Normally the app remembers the account, so this is skipped.
-    # if username:
-    #     for rid in ("username", "account", "phone", "user", "userId"):
-    #         el = d(resourceId=rid)
-    #         if el.exists:
-    #             el.click()
-    #             time.sleep(0.4)
-    #             clear_and_type(d, username)
-    #             log("entered username")
-    #             break
+    # Prefer uiautomator2's FastInputIME (fast, hides the on-screen keyboard). But
+    # some devices (MIUI/Vivo/Oppo, locked-down builds) refuse to enable/set a
+    # third-party IME, and set_input_ime() then raises — which used to abort login
+    # entirely. Treat the special IME as OPTIONAL and fall back to `input text`,
+    # which types via the device's own keyboard and needs no IME at all.
+    ime_ok = False
+    try:
+        d.set_input_ime(True)
+        time.sleep(0.5)
+        ime_ok = True
+    except Exception as e:
+        log(f"⚠ FastInputIME unavailable on this device ({e}) — using input-text fallback")
     # Password: entered every time we hit the login screen.
     try:
         field.click()
-        d.send_keys("", clear=True)
-        for word in pwd:
-            d.send_keys(word, clear=False)
-            time.sleep(0.1)
+        time.sleep(0.3)
+        if ime_ok:
+            d.send_keys("", clear=True)
+            for word in pwd:
+                d.send_keys(word, clear=False)
+                time.sleep(0.1)
+        else:
+            clear_field(d)
+            type_via_input(d, pwd)
     finally:
-        # Disable only uiautomator2's temporary IME; Android restores the user's
-        # normal keyboard (Samsung Keyboard on this device).
-        d.set_input_ime(False)
+        # Restore the user's normal keyboard. Only meaningful (and only works) if
+        # we actually enabled FastInputIME; guard it so a failed enable can't throw.
+        if ime_ok:
+            try:
+                d.set_input_ime(False)
+            except Exception:
+                pass
 
     d.xpath('//*[@text="ເຂົ້າສູ່ລະບົບ"]').click()
     deadline = time.time() + 45
