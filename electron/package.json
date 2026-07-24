@@ -1,6 +1,6 @@
 {
 	"name": "device-manager",
-	"version": "1.0.7",
+	"version": "1.0.8",
 	"description": "Device Manager",
 	"author": "Device Manager",
 	"main": "main.js",
