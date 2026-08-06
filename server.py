@@ -21,7 +21,7 @@ eng = engine.Engine()
 def cors(resp):
     # the Electron renderer loads from file://; allow it to call this API
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Signature"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return resp
 
@@ -73,6 +73,15 @@ def creds(serial):
 @app.get("/api/settings")
 def get_settings():
     return jsonify(eng.get_settings())
+
+
+@app.post("/api/device-manager/activate")
+def activate_device_manager():
+    b = request.get_json(force=True, silent=True) or {}
+    return jsonify(eng.activate_device_manager(
+        b.get("activation_api_url", ""), b.get("device_manager_id", ""),
+        b.get("activation_code", ""),
+    ))
 
 
 # ---------- setting sets (named gateway profiles) ----------
@@ -129,7 +138,28 @@ def transactions_clear():
 
 @app.post("/api/withdraws")
 def withdraws_create():
-    b = request.get_json(force=True, silent=True) or {}
+    raw_body = request.get_data(cache=True)
+    try:
+        b = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify(ok=False, accepted=False, message="Request body must be valid JSON"), 400
+    if not isinstance(b, dict):
+        return jsonify(ok=False, accepted=False, message="Request body must be a JSON object"), 400
+
+    client_id = b.get("clientId") or b.get("client_id")
+    verified, message, status = eng.verify_withdraw_signature(
+        client_id, raw_body, request.headers.get("X-Signature")
+    )
+    if not verified:
+        eng.log(f"⚠ withdraw request rejected: {message}")
+        return jsonify(
+            ok=False,
+            accepted=False,
+            message=message,
+            requestId=b.get("requestId") or b.get("request_id") or "",
+            received_at=time.time(),
+        ), status
+
     src = request.headers.get("X-Forwarded-For") or request.remote_addr or ""
     res = eng.receive_withdraw_request(b, src)
     status = int(res.pop("code", 200))
@@ -144,7 +174,10 @@ def sync_status():
 @app.post("/api/sync/start")
 def sync_start():
     b = request.get_json(force=True, silent=True) or {}
-    return jsonify(eng.start_sync(b.get("token")))
+    return jsonify(eng.start_sync(
+        b.get("token"), b.get("device_manager_id"),
+        b.get("withdraw_callback_url"),
+    ))
 
 
 @app.post("/api/sync/stop")

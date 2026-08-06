@@ -13,6 +13,12 @@ import queue
 import threading
 import subprocess
 import collections
+import hashlib
+import hmac
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import requests
 
 import bcel
 import csl_client
@@ -165,8 +171,7 @@ class Engine:
         self._SENT_MAX = 10000          # kept in memory
         self._SENT_PERSIST = 3000       # kept on disk
         self._withdraw_prepare_lock = threading.Lock()
-        self._withdraw_prepare_active = False
-        self._withdraw_prepare_serial = ""
+        self._withdraw_prepare_serials = set()
         for k in self.settings.get("sent_refs", []):
             self._sent_refs[k] = True
 
@@ -220,80 +225,281 @@ class Engine:
             } for d in devices],
         }
 
-    def _prepare_withdraw_device(self, serial, to_account, to_name, amount, remark=""):
+    def _withdraw_callback_url(self):
+        """Read the shared Sync callback URL, with a safe one-set migration."""
+        callback_url = (self.settings.get("withdraw_callback_url") or "").strip()
+        if callback_url:
+            return callback_url
+        legacy_urls = {
+            (gateway_set.get("withdraw_callback_url") or "").strip()
+            for gateway_set in self.settings.get("sets", {}).values()
+            if (gateway_set.get("withdraw_callback_url") or "").strip()
+        }
+        return legacy_urls.pop() if len(legacy_urls) == 1 else ""
+
+    def _withdraw_target(self, client_id):
+        matches = [
+            serial for serial, dev in self.settings.get("devices", {}).items()
+            if dev.get("role") == "withdraw"
+            and (self.settings.get("sets", {}).get(dev.get("set"), {}).get("client_id") or "") == client_id
+        ]
+        if not matches:
+            return None, f"clientId {client_id} has no assigned withdraw device"
+        if len(matches) > 1:
+            return None, f"clientId {client_id} has more than one assigned withdraw device"
+        serial = matches[0]
         creds = self.device_creds(serial)
-        pwd = creds.get("password", "") or ""
-        user = creds.get("username", "") or ""
-        card_no = creds.get("card_no", "") or ""
-        account_no = creds.get("account_no", "") or ""
+        if creds.get("role") != "withdraw":
+            return None, f"client {client_id} is not assigned to a withdraw device"
+        if not self._monitors.get(serial, {}).get("active"):
+            return None, f"withdraw device {serial} is not started"
+        gateway_set = self.settings.get("sets", {}).get(creds.get("set"), {})
+        callback_url = self._withdraw_callback_url()
+        parsed_callback = urlparse(callback_url)
+        if parsed_callback.scheme not in {"http", "https"} or not parsed_callback.netloc:
+            return None, "Withdrawal Callback URL is not configured"
+        callback_secret = (gateway_set.get("api_key") or "").strip()
+        if not callback_secret:
+            return None, "Withdrawal Callback Secret Key is not configured"
+        set_name = gateway_set.get("name", client_id)
+        return {
+            "id": client_id,
+            "name": set_name or client_id,
+            "serial": serial,
+            "callback_url": callback_url,
+            "callback_secret": callback_secret,
+        }, ""
+
+    def verify_withdraw_signature(self, client_id, raw_body, supplied_signature):
+        """Verify a withdraw request with the matching Gateway Set's Secret Key.
+
+        ``raw_body`` must be the original HTTP bytes.  Never JSON-serialize it
+        again here: even harmless whitespace changes would change the HMAC.
+        """
+        client_id = str(client_id or "").strip()
+        supplied_signature = str(supplied_signature or "").strip()
+        if not client_id:
+            return False, "clientId is required", 400
+        if not supplied_signature:
+            return False, "Unauthorized", 401
+
+        matches = [
+            gateway_set for gateway_set in self.settings.get("sets", {}).values()
+            if (gateway_set.get("client_id") or "").strip() == client_id
+        ]
+        if len(matches) != 1:
+            # Do not reveal whether a particular clientId is configured.
+            return False, "Unauthorized", 401
+        secret = (matches[0].get("api_key") or "").strip()
+        if not secret:
+            return False, "Withdrawal signing key is not configured", 503
+
+        expected = hmac.new(
+            secret.encode("utf-8"), raw_body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected, supplied_signature):
+            return False, "Unauthorized", 401
+        return True, "", 200
+
+    def _record_withdraw_transaction(self, record):
+        """Keep a withdraw record in the same in-memory activity list as deposits."""
+        self.transactions.append(record)
+        self.emit("transaction", record)
+
+    def _update_withdraw_transaction(self, transaction_id, **changes):
+        """Update and re-emit one in-memory withdraw record for the live UI."""
+        for record in reversed(self.transactions):
+            if record.get("id") != transaction_id:
+                continue
+            record.update(changes)
+            self.emit("transaction", record.copy())
+            return
+
+    @staticmethod
+    def _withdraw_api_status(record):
+        """Translate the local UI status to the external callback/API format."""
+        return {
+            "received": "PROCESSING",
+            "processing": "PROCESSING",
+            "success": "SUCCESS",
+            "failed": "FAILED",
+        }.get(record.get("status"), "PROCESSING")
+
+    def _withdraw_callback_error(self, raw_error):
+        """Map internal BCEL/device failures to stable callback error codes."""
+        raw_error = str(raw_error or "Unknown withdrawal error")
+        text = raw_error.lower()
+        if any(token in text for token in (
+            "input not found", "page verification failed", "automation failed",
+            "xpath", "unexpected ui",
+        )):
+            return "BCEL_UI_UNEXPECTED", "BCEL One automation failed"
+        if any(token in text for token in ("insufficient", "not enough", "balance")):
+            return "INSUFFICIENT_BALANCE", "Insufficient balance"
+        if any(token in text for token in ("invalid recipient", "invalid account", "account not found")):
+            return "INVALID_RECIPIENT_ACCOUNT", "Invalid recipient account"
+        if "limit" in text:
+            return "TRANSFER_LIMIT_EXCEEDED", "Transfer limit exceeded"
+        if any(token in text for token in ("offline", "not online", "disconnected", "unauthorized")):
+            return "DEVICE_OFFLINE", "Withdrawal device is unavailable"
+        if "timeout" in text:
+            return "BCEL_TIMEOUT", "BCEL One timed out"
+        if any(token in text for token in ("network", "connection")):
+            return "BCEL_NETWORK_ERROR", "BCEL One network error"
+        if any(token in text for token in ("login", "password", "authentication")):
+            return "AUTHENTICATION_FAILED", "BCEL One login failed"
+        if "security" in text and "answer" in text:
+            return "SECURITY_ANSWER_FAILED", "BCEL One security answer failed"
+        return "BCEL_UI_UNEXPECTED", "BCEL One automation failed"
+
+    def _send_withdraw_callback(self, transaction_id, callback_url, callback_secret,
+                                status, raw_error=""):
+        """POST one terminal withdrawal result to CSL Payment, retrying delivery.
+
+        A retry only repeats this callback; it never runs the BCEL transfer again.
+        """
+        record = next((item for item in reversed(self.transactions)
+                       if item.get("id") == transaction_id), None)
+        if not record:
+            return
+        completed_at = record.get("completed_at") or time.time()
+        payload = {
+            "withdrawalId": record.get("ref", ""),
+            "requestId": record.get("request_id", ""),
+            "clientId": record.get("client_id", ""),
+            "status": status,
+            "completedAt": datetime.fromtimestamp(
+                completed_at, timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
+        }
+        if status == "FAILED":
+            code, message = self._withdraw_callback_error(raw_error)
+            payload["error"] = {
+                "code": code,
+                "message": message,
+                "rawError": str(raw_error or "Unknown withdrawal error"),
+            }
+        raw_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        signature = hmac.new(
+            callback_secret.encode("utf-8"), raw_body.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        last_error = ""
+        for attempt, delay in enumerate((0, 1, 3), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                response = requests.post(
+                    callback_url,
+                    data=raw_body.encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Signature": signature,
+                    },
+                    timeout=15,
+                )
+                if 200 <= response.status_code < 300:
+                    self._update_withdraw_transaction(
+                        transaction_id, callback_status="sent",
+                        callback_sent_at=time.time(),
+                    )
+                    self.log(f"✓ withdrawal callback sent: requestId={payload['requestId']} status={status}")
+                    return
+                last_error = f"HTTP {response.status_code}"
+            except Exception as exc:
+                last_error = str(exc)
+            self.log(
+                f"⚠ withdrawal callback attempt {attempt}/3 failed: "
+                f"requestId={payload['requestId']} {last_error}"
+            )
+        self._update_withdraw_transaction(
+            transaction_id, callback_status="failed", callback_error=last_error,
+        )
+        self.log(f"✗ withdrawal callback delivery failed: requestId={payload['requestId']}")
+
+    def _dispatch_withdraw_callback(self, transaction_id, callback_url,
+                                    callback_secret, status, raw_error=""):
+        threading.Thread(
+            target=self._send_withdraw_callback,
+            args=(transaction_id, callback_url, callback_secret, status, raw_error),
+            daemon=True,
+        ).start()
+
+    def _prepare_withdraw_device(self, serial, to_account, to_name, amount, remark="",
+                                 transaction_id="", callback_url="", callback_secret=""):
+        creds = self.device_creds(serial)
+
+        def device_log(msg):
+            self.log(f"   {serial}: {msg}")
+
         security_answers = {
             "withdraw_a1": creds.get("withdraw_a1", "") or "",
             "withdraw_a2": creds.get("withdraw_a2", "") or "",
             "withdraw_a3": creds.get("withdraw_a3", "") or "",
         }
+        d = None
         try:
+            self._update_withdraw_transaction(
+                transaction_id,
+                status="processing",
+                from_account=creds.get("account_no", "") or "",
+            )
             self.log(f"… {serial}: opening BCEL One for withdraw request")
-            d = bcel.connect(serial, pwd, user, log=lambda msg: self.log(f"   {serial}: {msg}"), fresh=False)
-            bcel.select_unionpay_card(d, card_no, log=lambda msg: self.log(f"   {serial}: {msg}"))
-            bcel.verify_transfer_money_page(d, log=lambda msg: self.log(f"   {serial}: {msg}"))
-            bcel.select_source_account_on_transfer_page(d, account_no, log=lambda msg: self.log(f"   {serial}: {msg}"))
-            bcel.verify_receiver_account_page(d, log=lambda msg: self.log(f"   {serial}: {msg}"))
-            bcel.input_receiver_account(d, to_account, log=lambda msg: self.log(f"   {serial}: {msg}"))
-            bcel.click_receiver_next(d, log=lambda msg: self.log(f"   {serial}: {msg}"))
-            bcel.verify_transfer_amount_page(
+            d = bcel.connect(
+                serial,
+                creds.get("password", "") or "",
+                creds.get("username", "") or "",
+                log=device_log,
+                fresh=False,
+            )
+            completed = bcel.run_withdraw_flow(
                 d,
-                account_no,
+                creds.get("card_no", "") or "",
+                creds.get("account_no", "") or "",
                 to_account,
                 to_name,
-                log=lambda msg: self.log(f"   {serial}: {msg}")
-            )
-            bcel.input_transfer_amount(d, amount, log=lambda msg: self.log(f"   {serial}: {msg}"))
-            bcel.click_receiver_next(d, log=lambda msg: self.log(f"   {serial}: {msg}"))
-            bcel.input_security_answer(
-                d,
+                amount,
                 security_answers,
-                log=lambda msg: self.log(f"   {serial}: {msg}")
-            )
-            bcel.input_transfer_description(
-                d,
                 remark,
-                log=lambda msg: self.log(f"   {serial}: {msg}")
+                log=device_log,
             )
-            bcel.verify_transfer_confirmation_page(
-                d,
-                account_no,
-                to_account,
-                to_name,
-                log=lambda msg: self.log(f"   {serial}: {msg}")
-            )
-            bcel.click_transfer_confirm(
-                d,
-                log=lambda msg: self.log(f"   {serial}: {msg}")
-            )
-            bcel.check_transfer_result_modal(
-                d,
-                log=lambda msg: self.log(f"   {serial}: {msg}")
+            if not completed:
+                raise RuntimeError("transfer result was not detected")
+            self._update_withdraw_transaction(
+                transaction_id,
+                status="success",
+                completed_at=time.time(),
             )
             self.log(f"✓ {serial}: BCEL One ready for withdraw flow")
+            self._dispatch_withdraw_callback(
+                transaction_id, callback_url, callback_secret, "SUCCESS"
+            )
         except Exception as e:
+            self._update_withdraw_transaction(
+                transaction_id,
+                status="failed",
+                error=str(e),
+                completed_at=time.time(),
+            )
             self.log(f"✗ {serial}: withdraw app prepare failed: {e}")
+            self._dispatch_withdraw_callback(
+                transaction_id, callback_url, callback_secret, "FAILED", str(e)
+            )
             try:
-                if "d" in locals() and d is not None:
-                    bcel.recover_to_bcel_home(
-                        d,
-                        log=lambda msg: self.log(f"   {serial}: {msg}")
-                    )
+                if d is not None:
+                    bcel.recover_to_bcel_home(d, log=device_log)
             except Exception as recover_error:
                 self.log(f"   {serial}: home recovery failed: {recover_error}")
         finally:
             with self._withdraw_prepare_lock:
-                if self._withdraw_prepare_serial == serial:
-                    self._withdraw_prepare_active = False
-                    self._withdraw_prepare_serial = ""
+                self._withdraw_prepare_serials.discard(serial)
 
     def receive_withdraw_request(self, payload, source=""):
         source = (source or "unknown").strip()
         payload = payload or {}
+        client_id = str(payload.get("clientId") or payload.get("client_id") or "").strip()
+        request_id = str(payload.get("requestId") or payload.get("request_id") or "").strip()
         withdrawal_id = str(payload.get("withdrawalId") or payload.get("withdraw_id") or "").strip()
         amount = payload.get("amount")
         currency = str(payload.get("currency") or "").strip()
@@ -306,6 +512,7 @@ class Engine:
         except Exception:
             body = "{}"
         summary = (
+            f"requestId={request_id or '-'} "
             f"withdrawalId={withdrawal_id or '-'} "
             f"amount={amount if amount is not None else '-'} "
             f"currency={currency or '-'} "
@@ -314,7 +521,50 @@ class Engine:
             f"toName={to_name or '-'}"
         )
         snapshot = self._device_activity_snapshot()
-        active = snapshot.get("active_withdraw_device") or "-"
+        if not request_id:
+            msg = "requestId is required"
+            self.log(f"⚠ withdraw request rejected: {msg}")
+            return {"ok": False, "accepted": False, "message": msg, "code": 400}
+        if not withdrawal_id:
+            msg = "withdrawalId is required"
+            self.log(f"⚠ withdraw request rejected: {msg}")
+            return {
+                "ok": False, "accepted": False, "message": msg,
+                "requestId": request_id, "code": 400,
+            }
+
+        duplicate = next((record for record in reversed(self.transactions)
+                          if record.get("direction") == "withdraw"
+                          and record.get("client_id") == client_id
+                          and record.get("request_id") == request_id), None)
+        if duplicate:
+            msg = f"requestId {request_id} was already received"
+            self.log(f"⚠ withdraw request rejected: {msg}")
+            return {
+                "ok": False, "accepted": False, "message": msg,
+                "withdrawalId": duplicate.get("ref", withdrawal_id),
+                "requestId": request_id,
+                "status": self._withdraw_api_status(duplicate),
+                "code": 409,
+            }
+
+        duplicate = next((record for record in reversed(self.transactions)
+                          if record.get("direction") == "withdraw"
+                          and record.get("client_id") == client_id
+                          and record.get("ref") == withdrawal_id), None)
+        if duplicate:
+            msg = f"withdrawalId {withdrawal_id} was already received"
+            self.log(f"⚠ withdraw request rejected: {msg}")
+            return {
+                "ok": False, "accepted": False, "message": msg,
+                "withdrawalId": withdrawal_id,
+                "requestId": request_id,
+                "status": self._withdraw_api_status(duplicate),
+                "code": 409,
+            }
+
+        target, target_error = self._withdraw_target(client_id) if client_id else (None, "clientId is required")
+        active = target["serial"] if target else "-"
         started = "yes" if snapshot.get("has_started_device") else "no"
         self.log(f"↘ withdraw request from {source}: {summary}")
         self.log(f"   device activity: started={started} active_withdraw_device={active}")
@@ -324,10 +574,10 @@ class Engine:
                 f"started={'yes' if d.get('started') else 'no'} "
                 f"status={d.get('status')} state={d.get('state')}"
             )
-        if snapshot.get("active_withdraw_device"):
+        if target:
             with self._withdraw_prepare_lock:
-                if self._withdraw_prepare_active:
-                    serial = self._withdraw_prepare_serial or snapshot["active_withdraw_device"]
+                if target["serial"] in self._withdraw_prepare_serials:
+                    serial = target["serial"]
                     msg = f"withdraw device {serial} is busy opening BCEL One"
                     self.log(f"⚠ {msg}")
                     self.debug("POST /api/withdraws", {
@@ -336,16 +586,40 @@ class Engine:
                         "rejected": True,
                         "message": msg,
                     }, source)
-                    return {"ok": False, "accepted": False, "message": msg, "code": 409}
-                self._withdraw_prepare_active = True
-                self._withdraw_prepare_serial = snapshot["active_withdraw_device"]
+                    return {
+                        "ok": False, "accepted": False, "message": msg,
+                        "requestId": request_id, "code": 409,
+                    }
+                self._withdraw_prepare_serials.add(target["serial"])
+            transaction_id = f"withdraw:{uuid.uuid4()}"
+            self._record_withdraw_transaction({
+                "id": transaction_id,
+                "request_id": request_id,
+                "serial": target["serial"],
+                "client_id": target["id"],
+                "client_name": target["name"],
+                "direction": "withdraw",
+                "status": "received",
+                "type": "withdraw",
+                "kind": "BCEL transfer",
+                "from_account": "",
+                "from_name": "",
+                "to_account": to_account,
+                "to_name": to_name,
+                "amount": amount if amount is not None else "",
+                "details": remark,
+                "ref": withdrawal_id,
+                "callback_status": "pending",
+                "synced_at": time.time(),
+            })
             threading.Thread(
                 target=self._prepare_withdraw_device,
-                args=(snapshot["active_withdraw_device"], to_account, to_name, amount, remark),
+                args=(target["serial"], to_account, to_name, amount, remark,
+                      transaction_id, target["callback_url"], target["callback_secret"]),
                 daemon=True,
             ).start()
         else:
-            msg = "no active withdraw device is started"
+            msg = target_error
             self.log(f"⚠ withdraw request received but {msg}")
             self.debug("POST /api/withdraws", {
                 "request": payload,
@@ -353,19 +627,56 @@ class Engine:
                 "rejected": True,
                 "message": msg,
             }, source)
-            return {"ok": False, "accepted": False, "message": msg, "code": 409}
+            return {
+                "ok": False, "accepted": False, "message": msg,
+                "requestId": request_id, "code": 409,
+            }
         self.debug("POST /api/withdraws", {
             "request": payload,
             "deviceActivity": snapshot,
         }, source)
-        return {"ok": True, "accepted": True}
+        return {
+            "ok": True, "accepted": True, "requestId": request_id,
+            "status": "PROCESSING",
+        }
 
     # ---------- settings (global) ----------
     def get_settings(self):
         return {
             "ngrok_token_set": bool(self.settings.get("ngrok_token")),
+            "device_manager_id": self.settings.get("device_manager_id", ""),
+            "withdraw_callback_url": self._withdraw_callback_url(),
+            "assigned_sync_domain": self.settings.get("assigned_sync_domain", ""),
+            "activation_api_url": self.settings.get("activation_api_url", ""),
             "default_api_url": GATEWAY_API_URL,
         }
+
+    def activate_device_manager(self, activation_api_url, device_manager_id, activation_code):
+        base_url = str(activation_api_url or "").rstrip("/")
+        device_manager_id = str(device_manager_id or "").strip()
+        if not (base_url and device_manager_id and activation_code):
+            return {"ok": False, "message": "Activation server URL, Device Manager ID, and Activation Code are required"}
+        try:
+            import requests
+            response = requests.post(
+                base_url + "/api/device-managers/activate",
+                json={"deviceManagerId": device_manager_id, "activationCode": activation_code},
+                timeout=15,
+            )
+            data = response.json()
+        except Exception as e:
+            return {"ok": False, "message": f"Activation request failed: {e}"}
+        token = str(data.get("ngrokToken") or "").strip()
+        domain = str(data.get("assignedDomain") or "").strip()
+        if response.status_code != 200 or not data.get("ok", True) or not (token and domain):
+            return {"ok": False, "message": data.get("message") or "Activation was rejected"}
+        with self._slock:
+            self.settings["activation_api_url"] = base_url
+            self.settings["device_manager_id"] = device_manager_id
+            self.settings["assigned_sync_domain"] = domain
+            self.settings["ngrok_token"] = token
+            save_settings(self.settings)
+        return {"ok": True, "domain": domain}
 
     # ---------- setting sets (named gateway profiles) ----------
     def sets(self):
@@ -532,7 +843,7 @@ class Engine:
                 return
             self._monitors[serial] = {"active": True, "mode": "withdraw"}
             self._set_status(serial, "monitoring")
-            self.log(f"▶ {serial}: withdraw device started (runner not implemented yet)")
+            self.log(f"▶ {serial}: withdraw device ready to receive withdrawal requests")
             return
         # don't spin up a monitor for a device adb can't actually drive
         st = device_state(serial)
@@ -651,11 +962,17 @@ class Engine:
         url = self._detect_tunnel()
         return {"running": bool(url), "url": url or ""}
 
-    def start_sync(self, token=None):
+    def start_sync(self, token=None, device_manager_id=None, withdraw_callback_url=None):
         token = (token or self.settings.get("ngrok_token") or "").strip()
         if not token:
             return {"ok": False, "error": "No Sync token set"}
-        self.save_token(token)
+        with self._slock:
+            self.settings["ngrok_token"] = token
+            if device_manager_id is not None:
+                self.settings["device_manager_id"] = str(device_manager_id).strip()
+            if withdraw_callback_url is not None:
+                self.settings["withdraw_callback_url"] = str(withdraw_callback_url).strip()
+            save_settings(self.settings)
         existing = self._detect_tunnel()
         if existing:
             return {"ok": True, "url": existing}
@@ -666,7 +983,8 @@ class Engine:
             if ng:
                 conf.get_default().ngrok_path = ng
             ngrok.set_auth_token(token)
-            tunnel = ngrok.connect("8000", "http")
+            domain = (self.settings.get("assigned_sync_domain") or "").strip()
+            tunnel = ngrok.connect("8000", "http", domain=domain) if domain else ngrok.connect("8000", "http")
             url = tunnel.public_url.replace("http://", "https://")
             self.log(f"Sync started: {url}")
             return {"ok": True, "url": url}

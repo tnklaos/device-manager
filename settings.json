@@ -1,5 +1,5 @@
 {
-  "ngrok_token": "",
+  "ngrok_token": "36Xfnq3l7PZHmhHbQsIBT75RBRU_d7zYnQrTJpko8ZwFrsL2",
   "devices": {
     "R5CT82YM38H": {
       "set": "acb68231",
@@ -60,5 +60,6 @@
     "202606253152212",
     "202606251056844",
     "20260625510633"
-  ]
+  ],
+  "device_manager_id": "dm-internal-test"
 }

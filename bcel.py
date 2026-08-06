@@ -20,6 +20,7 @@ import uiautomator2 as u2
 
 PKG = "com.bcel.bcelone"
 HERE = os.path.dirname(os.path.abspath(__file__))
+UI_TRANSITION_SETTLE = 0.25
 
 
 # hide the per-child console window on Windows (0 on macOS/Linux)
@@ -750,7 +751,9 @@ def select_source_account_on_transfer_page(d, account_no, log=print):
         f"screen={number['text']}"
     )
     d.click(cx, cy)
-    time.sleep(1)
+    # The caller verifies the receiver page immediately afterwards, so do not
+    # pay a blind one-second delay after a successful tap.
+    time.sleep(UI_TRANSITION_SETTLE)
     return True
 
 
@@ -803,6 +806,22 @@ def input_receiver_account(d, to_account, log=print, timeout=8):
     last_seen = []
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # Current BCEL One renders this field as an otherwise empty EditText:
+        # no text, hint, resource id, or content description is exposed.  This
+        # function is called only after verify_receiver_account_page(), so the
+        # first visible EditText is the receiver-account input, not an input on
+        # an unrelated page.
+        try:
+            receiver_input = d(className="android.widget.EditText")
+            if receiver_input.exists:
+                receiver_input.click()
+                time.sleep(0.4)
+                replace_focused_text(d, raw_value, log=log, field_name="receiver account")
+                log(f"entered receiver account from request: ...{raw_value[-4:]}")
+                return True
+        except Exception:
+            pass
+
         for label in candidates:
             try:
                 el = d(text=label)
@@ -908,11 +927,11 @@ def click_receiver_next(d, log=print, timeout=8):
                         cy = int((bounds.get("top", 0) + bounds.get("bottom", 0)) / 2)
                         log(f"clicking receiver next: {label}")
                         d.click(cx, cy)
-                        time.sleep(1)
+                        time.sleep(UI_TRANSITION_SETTLE)
                         return True
                     el.click()
                     log(f"clicking receiver next: {label}")
-                    time.sleep(1)
+                    time.sleep(UI_TRANSITION_SETTLE)
                     return True
             except Exception:
                 pass
@@ -1106,11 +1125,13 @@ def click_transfer_confirm(d, log=print, timeout=8):
                         cy = int((bounds.get("top", 0) + bounds.get("bottom", 0)) / 2)
                         log(f"click transfer: {label}")
                         d.click(cx, cy)
-                        time.sleep(1)
+                        # The result checker below waits for a success/error
+                        # state, so only allow the UI one short turn here.
+                        time.sleep(UI_TRANSITION_SETTLE)
                         return True
                     el.click()
                     log(f"click transfer: {label}")
-                    time.sleep(1)
+                    time.sleep(UI_TRANSITION_SETTLE)
                     return True
             except Exception:
                 pass
@@ -1158,6 +1179,81 @@ def check_transfer_result_modal(d, log=print, timeout=6):
 
         time.sleep(0.5)
     return False
+
+
+def open_withdraw_transfer_page(d, card_no, log=print):
+    """Open Transfer Money from the BCEL One home/card services menu.
+
+    On current BCEL One builds, tapping the UnionPay card number opens the ATM
+    cash-withdrawal amount page, not bank transfer.  The ``ໂອນເງິນ`` service
+    shown on the home card is the correct route for an account transfer.
+    ``card_no`` remains in the function signature for compatibility with the
+    configured device data, but is not used to select the transfer route.
+    """
+    go_home(d, log=log)
+    click_transfer_on_unionpay_detail(d, log=log)
+    verify_transfer_money_page(d, log=log)
+
+
+def complete_withdraw_receiver_page(d, source_account, to_account, log=print):
+    """Select the source account and submit the receiver account page."""
+    select_source_account_on_transfer_page(d, source_account, log=log)
+    verify_receiver_account_page(d, log=log)
+    input_receiver_account(d, to_account, log=log)
+    click_receiver_next(d, log=log)
+
+
+def complete_withdraw_amount_page(
+        d, source_account, to_account, to_name, amount, log=print):
+    """Verify the transfer parties, enter the amount, and continue."""
+    verify_transfer_amount_page(
+        d, source_account, to_account, to_name, log=log
+    )
+    input_transfer_amount(d, amount, log=log)
+    click_receiver_next(d, log=log)
+
+
+def complete_withdraw_security_pages(d, security_answers, log=print):
+    """Complete the optional sequence of security-answer pages."""
+    return input_security_answer(d, security_answers, log=log)
+
+
+def complete_withdraw_description_page(d, remark, log=print):
+    """Complete the optional transfer-description page."""
+    return input_transfer_description(d, remark, log=log)
+
+
+def complete_withdraw_confirmation_page(
+        d, source_account, to_account, to_name, log=print):
+    """Verify the final transfer details and submit the transfer."""
+    verify_transfer_confirmation_page(
+        d, source_account, to_account, to_name, log=log
+    )
+    click_transfer_confirm(d, log=log)
+
+
+def complete_withdraw_result_page(d, log=print):
+    """Handle either the success page or the transfer error modal."""
+    return check_transfer_result_modal(d, log=log)
+
+
+def run_withdraw_flow(
+        d, card_no, source_account, to_account, to_name, amount,
+        security_answers, remark="", log=print):
+    """Run the BCEL withdrawal UI flow from card selection through result."""
+    open_withdraw_transfer_page(d, card_no, log=log)
+    complete_withdraw_receiver_page(
+        d, source_account, to_account, log=log
+    )
+    complete_withdraw_amount_page(
+        d, source_account, to_account, to_name, amount, log=log
+    )
+    complete_withdraw_security_pages(d, security_answers, log=log)
+    complete_withdraw_description_page(d, remark, log=log)
+    complete_withdraw_confirmation_page(
+        d, source_account, to_account, to_name, log=log
+    )
+    return complete_withdraw_result_page(d, log=log)
 
 
 def recover_to_bcel_home(d, log=print, tries=3):
@@ -1630,7 +1726,7 @@ def click_transfer_on_unionpay_detail(d, log=print, timeout=8):
         ):
             log(f"{label}: {target_node['text']}")
             d.click(cx, tap_y)
-            time.sleep(1.0)
+            time.sleep(UI_TRANSITION_SETTLE)
             if _is_transfer_money_page_from_dump(d):
                 return True
 
@@ -1728,13 +1824,16 @@ def do_login(d, pwd, username="", log=print):
     #             clear_and_type(d, username)
     #             log("entered username")
     #             break
-    # Password: entered every time we hit the login screen.
-    d.xpath('//*[@hint="ລະຫັດຜ່ານ"]').click()
-    d.send_keys("", clear=True)  # ch is undefined
-    
-    for word in pwd:
-        d.send_keys(word, clear=False)  # ch is undefined
-        time.sleep(0.1)
+    # The current BCEL One login is a WebView.  Its password field has no
+    # ``hint`` attribute, but UIAutomator exposes it as EditText/password=true.
+    # Keep the older Lao hint as a fallback for previous app builds.
+    password_field = d.xpath('//*[@password="true"]')
+    if not password_field.exists:
+        password_field = d.xpath('//*[@hint="ລະຫັດຜ່ານ"]')
+    if not password_field.exists:
+        raise RuntimeError("BCEL One login password field was not found")
+    password_field.click()
+    replace_focused_text(d, pwd, log=log, field_name="login password")
 
     d.xpath('//*[@text="ເຂົ້າສູ່ລະບົບ"]').click()
     deadline = time.time() + 45

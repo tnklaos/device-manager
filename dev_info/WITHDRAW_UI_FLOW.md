@@ -1,235 +1,242 @@
 # Withdraw UI Flow
 
-เอกสารนี้สรุป flow ปัจจุบันของหน้า withdraw ใน BCEL One ตามโค้ดที่ใช้อยู่ตอนนี้ใน `engine.py` และ `bcel.py`
+This document summarizes the current BCEL One withdrawal flow based on the code currently used in `engine.py` and `bcel.py`.
 
-## 1. Flow หลัก
+## 1. Main Flow
 
-ลำดับที่ backend รันตอนเตรียม withdraw device:
+The backend performs these steps when preparing a withdrawal device:
 
-1. เช็ก current page ของ BCEL One ก่อน แล้ว login เฉพาะถ้าจำเป็น
-2. เลือกบัตร UnionPay
-3. ตรวจหน้า `Transfer Money`
-4. เลือก source account
-5. ตรวจหน้า `Receiver Account`
-6. กรอกบัญชีปลายทาง
-7. กดปุ่มไปหน้าถัดไป
-8. ตรวจหน้า `Transfer Amount`
-9. กรอกจำนวนเงิน
-10. กดปุ่มไปหน้าถัดไป
-11. จัดการหน้า `Security Answer` ถ้ามี
-12. จัดการหน้า `Transfer Description` ถ้ามี
-13. ตรวจหน้า `Transfer Confirmation`
-14. คลิกปุ่ม `ໂອນເງິນ` / `Transfer`
-15. แยก `success page` ออกจาก `error modal`
-16. ถ้าสำเร็จ กด `ສໍາເລັດ` / `Done` แล้วเช็กว่ากลับ home
-17. ถ้าล้มเหลว อ่านข้อความบน modal แล้ว throw fail
-18. ถ้า flow fail ระหว่างทาง ให้พยายาม recover กลับ home
+1. Check the current BCEL One page and log in only when necessary.
+2. Select the UnionPay card.
+3. Verify the `Transfer Money` page.
+4. Select the source account.
+5. Verify the `Receiver Account` page.
+6. Enter the destination account.
+7. Click the button to continue to the next page.
+8. Verify the `Transfer Amount` page.
+9. Enter the transfer amount.
+10. Click the button to continue to the next page.
+11. Handle the `Security Answer` page if it appears.
+12. Handle the `Transfer Description` page if it appears.
+13. Verify the `Transfer Confirmation` page.
+14. Click the `ໂອນເງິນ` / `Transfer` button.
+15. Distinguish the `success page` from an `error modal`.
+16. On success, click `ສໍາເລັດ` / `Done` and verify that the app returns home.
+17. On failure, read the modal message and raise an error.
+18. If the flow fails along the way, attempt to recover and return home.
 
-อ้างอิงจาก `engine.Engine._prepare_withdraw_device(...)`
+Flow entry points:
+- `engine.Engine._prepare_withdraw_device(...)` manages device connection, recovery, and locking.
+- `bcel.run_withdraw_flow(...)` runs the withdrawal pages in order.
 
-## 2. การเริ่มต้นตอน receive request
+## 2. Initialization When a Request Is Received
 
-ตอนนี้ `connect(...)` ไม่ได้ restart app ทุกครั้งแล้ว แต่จะเช็ก state ปัจจุบันก่อน:
+Every withdrawal request must include `clientId`. The engine matches this value
+to the existing Gateway Set's Client ID, then finds the started withdraw device
+assigned to that same set. Each device has its own in-progress guard, so
+separate clients can run at the same time when they use different Android devices.
 
-1. ถ้า `fresh=True`
-   - restart แอป
-2. ถ้า current package เป็น BCEL อยู่แล้ว
-   - ปิด popup ที่บังหน้า ถ้ามี
-   - ถ้าเป็น login screen ให้ login
-   - ถ้าอยู่ home อยู่แล้ว ให้ reuse ต่อทันที
-   - ถ้าอยู่กลาง flow/page อื่น ให้พยายาม `go_home(...)`
-3. ถ้ายังไม่ได้อยู่ใน BCEL
-   - ค่อย `app_start(...)`
+`connect(...)` no longer restarts the app for every request. It checks the current state first:
 
-สรุป:
-- ถ้าอยู่ home page แล้ว จะไม่ login ใหม่
-- ถ้า session ยังอยู่ จะ reuse app state เดิม
-- login จะเกิดเฉพาะตอนเจอ login screen จริงเท่านั้น
+1. If `fresh=True`:
+   - Restart the app.
+2. If the current package is already BCEL:
+   - Close any popup blocking the page.
+   - Log in if the login screen is displayed.
+   - Reuse the current state immediately if the app is already home.
+   - Attempt `go_home(...)` if the app is in the middle of another flow or page.
+3. If the app is not currently in BCEL:
+   - Run `app_start(...)`.
 
-## 3. หน้าที่ระบบรู้จัก
+Summary:
+- The app does not log in again when it is already on the home page.
+- The existing app state is reused while the session remains active.
+- Login occurs only when the login screen is actually detected.
+
+## 3. Recognized Pages
 
 ### 3.1 Transfer Money
 
-ชื่อหน้าที่ใช้เช็ก:
+Recognized page titles:
 - `ການໂອນເງິນ`
 - `Transfer Money`
 
-สิ่งที่ระบบทำ:
-- เช็กว่าอยู่หน้าโอนเงิน
-- หา source account จากเลขบัญชีที่ save ไว้
-- คลิกแถวของบัญชีนั้น
+System actions:
+- Verify that the transfer page is displayed.
+- Find the source account using the saved account number.
+- Click that account's row.
 
 ### 3.2 Receiver Account
 
-ชื่อหน้าที่ใช้เช็ก:
+Recognized page titles:
 - `ບັນຊີປາຍທາງ`
 - `Receiver Account`
 - `Receivers Account`
 
-สิ่งที่ระบบทำ:
-- เช็กว่ามาถึงหน้าบัญชีปลายทาง
-- กรอก `toAccount` จาก request
-- กดปุ่มไปหน้าถัดไป
+System actions:
+- Verify that the destination account page is displayed.
+- Enter `toAccount` from the request.
+- Click the button to continue to the next page.
 
 ### 3.3 Transfer Amount
 
-ชื่อหน้าที่ใช้เช็ก:
-- section `ຈາກບັນຊີ` / `From Account`
-- section `ຫາບັນຊີ` / `To Account`
-- ชื่อผู้รับต้องตรงกับ `toName`
+Page verification criteria:
+- `ຈາກບັນຊີ` / `From Account` section.
+- `ຫາບັນຊີ` / `To Account` section.
+- The recipient name must match `toName`.
 
-สิ่งที่ระบบทำ:
-- ตรวจว่า source account ตรง
-- ตรวจว่า destination account ตรง
-- ตรวจว่าชื่อผู้รับตรง
-- กรอกจำนวนเงิน
-- กดปุ่มไปหน้าถัดไป
+System actions:
+- Verify that the source account matches.
+- Verify that the destination account matches.
+- Verify that the recipient name matches.
+- Enter the transfer amount.
+- Click the button to continue to the next page.
 
 ### 3.4 Security Answer
 
-ชื่อหน้าที่ใช้เช็ก:
-- title `ຢັ້ງຢືນຕົວຕົນເພີ່ມເຕີມ`
-- หรือมี `pageq1/pageq2/pageq3`
-- หรือมี `ans1/ans2/ans3`
+Page verification criteria:
+- The title is `ຢັ້ງຢືນຕົວຕົນເພີ່ມເຕີມ`.
+- Or `pageq1/pageq2/pageq3` is present.
+- Or `ans1/ans2/ans3` is present.
 
-ข้อความที่ใช้บอกข้อ:
+Question indicators:
 - `ຄໍາຖາມທີ 1/2/3`
 - `ຄຳຖາມທີ 1/2/3`
 - `Question 1/2/3`
 
-ช่อง input ที่ใช้:
+Input fields:
 - `ans1`
 - `ans2`
 - `ans3`
 
-สิ่งที่ระบบทำ:
-1. ถ้าอยู่หน้า security answer จะหา current question index ก่อน
-2. ลองพิมพ์ answer ใส่ active cursor ก่อน
-3. กดปุ่มไปหน้าถัดไป
-4. เช็กว่าหน้าเปลี่ยนหรือไม่
-5. ถ้าไม่เปลี่ยน ค่อย fallback ไปคลิก input จริง (`ans1/ans2/ans3`) แล้วพิมพ์ใหม่
-6. ทำซ้ำจนหมดทุกข้อ
+System actions:
+1. If the security answer page is displayed, determine the current question index.
+2. First, try typing the answer at the active cursor.
+3. Click the button to continue to the next page.
+4. Check whether the page changed.
+5. If it did not change, fall back to clicking the actual input (`ans1/ans2/ans3`) and type the answer again.
+6. Repeat until all questions are completed.
 
-จำนวนหน้าที่รองรับ:
-- 0 หน้า: ข้าม
-- 1 หน้า: answer 1 แล้วจบ
-- 2 หน้า: answer 1 -> answer 2
-- 3 หน้า: answer 1 -> answer 2 -> answer 3
+Supported number of pages:
+- 0 pages: skip this step.
+- 1 page: enter answer 1 and finish.
+- 2 pages: answer 1 -> answer 2.
+- 3 pages: answer 1 -> answer 2 -> answer 3.
 
 ### 3.5 Transfer Description
 
-ชื่อหน้าที่ใช้เช็ก:
+Recognized page titles:
 - `ຄໍາອະທິບາຍການໂອນ`
 - `ຄຳອະທິບາຍການໂອນ`
 - `Transfer Description`
 
-placeholder ที่ใช้:
+Recognized placeholders:
 - `ປ້ອນຄໍາອະທິບາຍ`
 - `ປ້ອນຄຳອະທິບາຍ`
 
-input ที่ควร match:
+Expected input matches:
 - `rid=desc`
 - `class=android.widget.EditText`
 
-สิ่งที่ระบบทำ:
-1. ถ้าตรวจเจอหน้า description จะลองพิมพ์ใส่ active input ก่อน
-2. ถ้า active input path ไม่ผ่าน จะ fallback ไปหา input ใต้ title/placeholder
-3. ให้ `rid=desc` เป็นตัวเลือกอันดับแรก
-4. กรอกค่า `remark`
-5. กดปุ่มไปหน้าถัดไป
+System actions:
+1. When the description page is detected, first try typing into the active input.
+2. If the active-input path does not work, fall back to finding the input below the title or placeholder.
+3. Prefer `rid=desc` as the first option.
+4. Enter the `remark` value.
+5. Click the button to continue to the next page.
 
 ### 3.6 Transfer Confirmation
 
-สิ่งที่ระบบเช็ก:
-- section `ຈາກບັນຊີ` / `From Account`
-- section `ຫາບັນຊີ` / `To Account`
-- ชื่อผู้รับต้องตรงกับ `toName`
+Verification criteria:
+- `ຈາກບັນຊີ` / `From Account` section.
+- `ຫາບັນຊີ` / `To Account` section.
+- The recipient name must match `toName`.
 
-แนวทาง:
-- ใช้เงื่อนไขตรวจแบบเดียวกับหน้า `Transfer Amount`
-- ถ้าตรวจผ่าน จะ log `confirm page verified`
-- หลังจากนั้นระบบจะคลิกปุ่ม `ໂອນເງິນ` / `Transfer`
-- หลังคลิกแล้วระบบจะเช็กก่อนว่าเป็น `success page` หรือ `error modal`
+Approach:
+- Use the same verification conditions as the `Transfer Amount` page.
+- Log `confirm page verified` after successful verification.
+- Then click the `ໂອນເງິນ` / `Transfer` button.
+- After clicking, first determine whether the result is a `success page` or an `error modal`.
 
 ### 3.7 Transfer Success
 
-ตัวอย่างจุดสังเกต:
-- title ประเภท `ໂອນເງິນສໍາເລັດ`
-- ปุ่ม `ສໍາເລັດ` / `Done`
-- ข้อมูลใบเสร็จ เช่น `ເລກ Ticket`
+Example indicators:
+- A title such as `ໂອນເງິນສໍາເລັດ`.
+- The `ສໍາເລັດ` / `Done` button.
+- Receipt information such as `ເລກ Ticket`.
 
-สิ่งที่ระบบทำ:
-1. ถ้าตรวจเจอหน้า success จะ log `transfer success`
-2. กดปุ่ม `ສໍາເລັດ` / `Done`
-3. เช็กว่ากลับหน้า home หรือยัง
-4. ถ้ากลับ home แล้ว log `current page: home`
+System actions:
+1. Log `transfer success` when the success page is detected.
+2. Click the `ສໍາເລັດ` / `Done` button.
+3. Check whether the app has returned to the home page.
+4. Log `current page: home` after the app returns home.
 
-หมายเหตุ:
-- หน้า success จะไม่ถูกตีความเป็น fail modal
+Note:
+- The success page is not interpreted as a failure modal.
 
 ### 3.8 Transfer Error Modal
 
-ตัวอย่างปุ่มบน modal:
+Example modal buttons:
 - `ຕົກລົງ`
 - `OK`
 - `Close`
 - `ປິດ`
 
-สิ่งที่ระบบทำ:
-1. อ่านข้อความกลาง modal
-2. log `transfer failed: ...`
-3. raise error กลับไปที่ engine
+System actions:
+1. Read the message in the center of the modal.
+2. Log `transfer failed: ...`.
+3. Raise the error back to the engine.
 
-หมายเหตุ:
-- `remark` อ่านจาก request field ตามลำดับนี้:
+Note:
+- The `remark` value is read from the following request fields in order:
   - `remark`
   - `note`
   - `description`
 
-## 4. ปุ่มไปหน้าถัดไป
+## 4. Continue Button
 
-ปุ่มที่ helper ใช้กดได้ตอนนี้:
+The helper currently recognizes these buttons:
 - `ຕໍ່ໄປ`
 - `Next`
 - `ເພີ່ມບັນຊີ`
 - `Add Account`
 
-เหตุผล:
-- บางหน้าใช้ `Next`
-- บางหน้าสุดท้ายของ security flow ใช้ `Add Account`
+Reason:
+- Some pages use `Next`.
+- The final page of some security flows uses `Add Account`.
 
-## 5. แนวคิด fallback
+## 5. Fallback Strategy
 
-หลักการที่ใช้ตอนนี้:
+Current approach:
 
-1. พยายามใช้ `active cursor` ก่อน ในหน้าที่ UI จริงมัก focus ให้แล้ว
-2. ถ้า path นี้ไม่ทำให้หน้าเปลี่ยน ค่อย fallback ไปหา input จาก hierarchy
-3. ถ้าหา input จาก hierarchy:
-   - ใช้ `resource-id` ก่อน
-   - ถ้าไม่มี ใช้ label / hint / class / ตำแหน่งใต้ข้อความ
+1. First, try the `active cursor` on pages where the real UI usually focuses the field automatically.
+2. If this path does not change the page, fall back to locating the input in the UI hierarchy.
+3. When locating an input in the hierarchy:
+   - Prefer `resource-id`.
+   - If unavailable, use the label, hint, class, or position below the text.
 
-## 6. Fail Recovery
+## 6. Failure Recovery
 
-ถ้า flow fail ระหว่างทาง `engine` จะเรียก `recover_to_bcel_home(...)`
+If the flow fails along the way, the `engine` calls `recover_to_bcel_home(...)`.
 
-สิ่งที่ recovery ทำ:
-1. พยายามปิด popup ก่อน
+Recovery actions:
+1. First, attempt to close any popup using:
    - `ຕົກລົງ`
    - `OK`
    - `Close`
    - `ປິດ`
-2. ถ้ายังอยู่ใน BCEL จะใช้ `go_home(...)`
-3. ถ้ากลับ home สำเร็จ จะ log `back to home`
+2. If the app is still in BCEL, run `go_home(...)`.
+3. Log `back to home` after successfully returning home.
 
-สรุป:
-- fail แล้วจะไม่ค้างอยู่หน้ากลาง flow ถ้ากลับ home ได้
-- ทำให้ request รอบถัดไปเริ่มจาก state ที่คาดเดาได้ง่ายขึ้น
+Summary:
+- After a failure, the app does not remain stuck in the middle of the flow if it can return home.
+- This gives the next request a more predictable starting state.
 
-## 7. Log แบบใหม่
+## 7. Updated Logs
 
-ตอนนี้ log ถูกลดให้สั้นลงเพื่อให้อ่าน flow ง่ายขึ้น และมี log สำหรับ success/fail หลังโอนชัดขึ้น
+Logs are now shorter to make the flow easier to read, with clearer success and failure messages after a transfer.
 
-ตัวอย่าง:
+Examples:
 - `reuse current BCEL home`
 - `resume BCEL from .PageActivity`
 - `verified transfer money page`
@@ -250,19 +257,27 @@ input ที่ควร match:
 - `transfer failed: ...`
 - `back to home`
 
-## 8. จุดที่ยังควรจับตา
+## 8. Known Areas to Monitor
 
-1. หน้า WebView บางหน้ามี cursor active แต่ hierarchy ไม่สวย
-2. บาง input เป็น custom control แม้หน้าตาเหมือน `EditText`
-3. ADB keyboard `clear=True` เคยพังกับบางหน้า
-4. ดังนั้น flow ตอนนี้พยายามใช้ keyevent clear + `send_keys(..., clear=False)` มากกว่า
-5. หน้า success กับ modal fail ต้องแยกด้วย anchor หลายตัวร่วมกัน ไม่ควรดูแค่มีปุ่ม `Close`
+1. Some WebView pages have an active cursor but an unclear UI hierarchy.
+2. Some inputs are custom controls even though they look like `EditText` fields.
+3. ADB keyboard `clear=True` has failed on some pages.
+4. Therefore, the current flow prefers key-event clearing with `send_keys(..., clear=False)`.
+5. The success page and failure modal must be distinguished using multiple anchors; the presence of a `Close` button alone is not sufficient.
 
-## 9. ไฟล์ที่เกี่ยวข้อง
+## 9. Related Files
 
 - `engine.py`
   - `Engine._prepare_withdraw_device(...)`
 - `bcel.py`
+  - `run_withdraw_flow(...)`
+  - `open_withdraw_transfer_page(...)`
+  - `complete_withdraw_receiver_page(...)`
+  - `complete_withdraw_amount_page(...)`
+  - `complete_withdraw_security_pages(...)`
+  - `complete_withdraw_description_page(...)`
+  - `complete_withdraw_confirmation_page(...)`
+  - `complete_withdraw_result_page(...)`
   - `connect(...)`
   - `verify_transfer_money_page(...)`
   - `select_source_account_on_transfer_page(...)`
