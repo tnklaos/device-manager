@@ -58,12 +58,25 @@
 
       <section id="view-transactions" class="view hidden">
         <div class="tx-toolbar">
+          <div class="tx-filters" aria-label="Transaction type filter">
+            <button class="tx-filter active" data-tx-direction="all">All</button>
+            <button class="tx-filter" data-tx-direction="deposit">Deposit</button>
+            <button class="tx-filter" data-tx-direction="withdraw">Withdraw</button>
+          </div>
+          <select id="tx-status" aria-label="Transaction status filter">
+            <option value="all">All status</option>
+            <option value="received">Received</option>
+            <option value="processing">Processing</option>
+            <option value="success">Success</option>
+            <option value="failed">Failed</option>
+            <option value="synced">Synced</option>
+          </select>
           <input id="tx-search" type="text" placeholder="🔍  Search by account, name, ref, amount…" />
           <button id="tx-clear" class="btn ghost sm">Clear log</button>
         </div>
         <table class="tx-table">
           <thead><tr>
-            <th>Time</th><th>Device</th><th>Kind</th><th>Type</th>
+            <th>Time</th><th>Client</th><th>Device</th><th>Direction</th><th>Status</th><th>Kind</th><th>Type</th>
             <th>From (source account)</th><th>To</th>
             <th>Amount</th><th>Details</th><th>Reference</th>
           </tr></thead>
@@ -73,10 +86,8 @@
       </section>
 
       <section id="view-settings" class="view hidden">
-        <!-- tabbed items: one tab per gateway set, plus global Sync -->
         <div class="settabs" id="settabs"></div>
 
-        <!-- a set's editor -->
         <div id="set-editor" class="card form-card">
           <div class="set-editor-head">
             <h2 id="set-editor-title">Gateway Set</h2>
@@ -96,18 +107,23 @@
           </div>
         </div>
 
-        <!-- global Sync (shared by all sets) -->
-        <div id="sync-editor" class="card form-card hidden" style="margin-top:16px">
-          <h2>Sync <span id="sync-dot" class="dot off" style="display:inline-block;vertical-align:middle"></span></h2>
-          <p class="muted">Expose the local API over one public HTTPS URL, shared by all sets (optional).</p>
-          <label>Sync Token</label>
-          <input id="sync-token" type="password" placeholder="ngrok auth token" />
-          <div class="row-actions">
-            <button id="sync-start" class="btn green">Start Sync</button>
-            <button id="sync-stop" class="btn red">Stop</button>
-          </div>
-          <label>Public URL</label>
-          <input id="sync-url" type="text" readonly placeholder="(not running)" />
+        <div id="sync-editor" class="sync-layout hidden">
+          <section class="card sync-panel">
+            <h2>Connection <span id="sync-dot" class="dot off" style="display:inline-block;vertical-align:middle"></span></h2>
+            <p class="muted">One Sync connection is shared by every withdrawal client on this Device Manager.</p>
+            <label>Device Manager ID</label>
+            <input id="dm-id" type="text" placeholder="e.g. dm-vientiane-01" />
+            <label>Sync Token</label>
+            <input id="sync-token" type="password" placeholder="ngrok auth token" />
+            <label>Withdrawal Callback URL</label>
+            <input id="sync-withdraw-callback" type="url" placeholder="https://your-server.example.com/api/withdrawals/callback" />
+            <div class="row-actions">
+              <button id="sync-start" class="btn green">Start Sync</button>
+              <button id="sync-stop" class="btn red">Stop</button>
+            </div>
+            <label>Public URL</label>
+            <input id="sync-url" type="text" readonly placeholder="(not running)" />
+          </section>
         </div>
       </section>
 
@@ -134,8 +150,25 @@
       <input id="m-user" type="text" placeholder="(usually blank)" />
       <label>Password</label>
       <input id="m-pass" type="password" />
-      <label>Last reference (watermark)</label>
-      <input id="m-ref" type="text" placeholder="blank = set baseline on next poll" />
+      <label>Device role</label>
+      <div id="m-role-picker" class="role-picker">
+        <button id="m-role-trigger" class="role-trigger" type="button">
+          <span id="m-role-label">Deposit</span>
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 7.5l5 5 5-5"/></svg>
+        </button>
+        <div id="m-role-menu" class="role-menu hidden">
+          <button type="button" data-role="deposit">Deposit</button>
+          <button type="button" data-role="withdraw">Withdraw</button>
+        </div>
+      </div>
+      <select id="m-role" class="hidden">
+        <option value="deposit">Deposit</option>
+        <option value="withdraw">Withdraw</option>
+      </select>
+      <div id="m-watermark-field">
+        <label>Last reference (watermark)</label>
+        <input id="m-ref" type="text" placeholder="blank = set baseline on next poll" />
+      </div>
       <div class="row-actions">
         <button id="m-save" class="btn primary">Save</button>
         <button id="m-cancel" class="btn ghost">Cancel</button>

@@ -92,7 +92,7 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 .btn.ghost { background: transparent; color: var(--sub); border: 1px solid var(--line); }
 .btn.sm { padding: 6px 9px; font-size: 12px; }
 
-/* Settings: set tabs */
+/* Settings tabs */
 .settabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
 .settab {
   background: var(--card); color: var(--sub); border: 1px solid var(--line);
@@ -101,7 +101,9 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 }
 .settab:hover { background: var(--card-h); color: var(--text); }
 .settab.active { background: var(--indigo); color: #fff; border-color: var(--indigo); }
-.settab.add { color: var(--sub); border-style: dashed; }
+.settab {
+}
+.settab.add { color: #fff; border-style: dashed; }
 .set-editor-head { display: flex; align-items: center; justify-content: space-between; }
 .set-editor-head h2 { margin: 0; }
 
@@ -130,6 +132,13 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 
 /* Transactions toolbar */
 .tx-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+.tx-filters { display: flex; gap: 4px; }
+.tx-filter, #tx-status {
+  border: 1px solid var(--line); background: var(--card); color: var(--sub); border-radius: 8px;
+  padding: 8px 10px; font-size: 12px; cursor: pointer;
+}
+.tx-filter.active { background: var(--indigo); border-color: var(--indigo); color: #fff; }
+#tx-status { cursor: pointer; }
 .tx-toolbar input {
   flex: 1; background: var(--card); border: 1px solid var(--line); color: var(--text);
   border-radius: 9px; padding: 9px 12px; font-size: 13px; outline: none;
@@ -143,17 +152,35 @@ nav { display: flex; flex-direction: column; gap: 4px; }
 .tx-table tr:hover td { background: #11161f; }
 .tx-amount { color: var(--green); font-weight: 700; font-family: "SF Mono", Menlo, monospace; }
 .tx-table .mono { color: var(--sub); }
+.tx-badge { display: inline-block; border-radius: 999px; padding: 3px 7px; font-size: 11px; font-weight: 700; text-transform: capitalize; }
+.direction-deposit { color: #86efac; background: #14532d55; }
+.direction-withdraw { color: #c4b5fd; background: #5b21b655; }
+.status-synced, .status-success { color: #86efac; background: #14532d55; }
+.status-received, .status-processing { color: #93c5fd; background: #1e3a8a55; }
+.status-failed { color: #fca5a5; background: #7f1d1d66; }
 
 /* Forms */
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
 .form-card { max-width: 520px; }
 .form-card h2 { margin: 0 0 4px; font-size: 16px; }
+.sync-layout { display: grid; grid-template-columns: minmax(380px, 520px); gap: 16px; align-items: start; max-width: 520px; }
+.sync-panel h2 { margin: 0 0 4px; font-size: 16px; }
+.sync-panel > p { margin: 6px 0 14px; }
 .card label, .modal label { display: block; color: var(--sub); font-size: 12px; margin: 14px 0 6px; }
-.card input, .modal input {
+.card input, .card select, .modal input {
   display: block; width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--text);
   border-radius: 9px; padding: 10px 12px; font-size: 13px; outline: none;
 }
-.card input:focus, .modal input:focus { border-color: var(--indigo); }
+.card input:focus, .card select:focus, .modal input:focus { border-color: var(--indigo); }
+.role-picker { position: relative; }
+.role-trigger { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--bg); color: var(--text); font-size: 13px; cursor: pointer; }
+.role-trigger:hover, .role-trigger:focus { border-color: var(--indigo); }
+.role-trigger svg { width: 16px; height: 16px; color: var(--sub); }
+.role-menu { position: absolute; z-index: 60; top: calc(100% + 5px); left: 0; right: 0; padding: 5px; border: 1px solid #344057; border-radius: 9px; background: #1b2230; box-shadow: 0 14px 34px rgba(0,0,0,.42); }
+.role-menu button { width: 100%; border: 0; border-radius: 6px; padding: 8px 9px; background: transparent; color: var(--text); text-align: left; font-size: 12px; cursor: pointer; }
+.role-menu button:hover, .role-menu button.active { background: #2f3475; color: #fff; }
+.withdraw-sync-hint { margin-top: 9px; color: #fbbf24; font-size: 11px; }
+.actions .btn:disabled { cursor: not-allowed; opacity: .5; filter: saturate(.55); }
 .row-actions { display: flex; align-items: center; gap: 12px; margin-top: 18px; }
 
 /* Guide */

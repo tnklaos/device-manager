@@ -29,6 +29,7 @@ $$(".nav").forEach((n) => n.addEventListener("click", () => showView(n.dataset.v
 
 // ---------- devices ----------
 let devices = [];
+let syncRunning = false;
 function statusDot(s) {
 	// green = running, red = disconnected, amber = unauthorized/reconnecting, gray = idle
 	const color = s === "monitoring" ? "#22c55e"
@@ -44,6 +45,8 @@ function renderDevices() {
 	$("#counter").textContent = `${monitoring} monitoring`;
 	grid.innerHTML = devices.map((d) => {
 		const running = d.monitoring;
+		const isWithdraw = d.role === "withdraw";
+		const withdrawBlocked = isWithdraw && !syncRunning;
 		const selectedSet = sets.find((s) => s.id === d.set);
 		const selectedSetName = selectedSet ? (selectedSet.name || "Untitled") : "Set";
 		const setOptions = [
@@ -63,14 +66,15 @@ function renderDevices() {
       </div>
 	      <div class="meta">
 	        <span class="${d.has_creds ? "ok" : ""}">${d.has_creds ? "● credentials set" : "○ no credentials"}</span>
+			${d.role === "withdraw" ? `<span>Withdraw: ${esc(selectedSetName)}</span>` : ""}
 	        ${d.state && d.state !== "device"
 				? `<span class="warn">⚠ ${d.state === "unauthorized" ? "unauthorized — tap Allow on the phone" : d.state}</span>`
 				: ""}
 	      </div>
 	      <div class="actions">
 	        ${running
-					? `<button class="btn red sm" data-act="stop">Stop</button>`
-					: `<button class="btn green sm" data-act="start">Start</button>`}
+					? `<button class="btn red sm" data-act="stop">${isWithdraw ? "Stop withdrawal" : "Stop"}</button>`
+					: `<button class="btn green sm" data-act="start" ${withdrawBlocked ? "disabled" : ""} title="${withdrawBlocked ? "Start Sync in Settings before starting withdrawals" : ""}">${isWithdraw ? "Start withdrawal" : "Start"}</button>`}
 	        <div class="set-picker">
 	          <button class="set-trigger" type="button">
 	            <span>${esc(selectedSetName)}</span>
@@ -81,6 +85,7 @@ function renderDevices() {
 	        <button class="btn ghost sm" data-act="set" title="Credentials / settings">⚙</button>
 	        <button class="btn ghost sm" data-act="disconnect">Disconnect</button>
 	      </div>
+			${withdrawBlocked ? `<div class="withdraw-sync-hint">Start Sync in Settings before starting withdrawals.</div>` : ""}
     </div>`;
 	}).join("");
 
@@ -122,7 +127,10 @@ function closeSetMenus(except) {
 		if (menu !== except) menu.classList.add("hidden");
 	});
 }
-document.addEventListener("click", () => closeSetMenus());
+document.addEventListener("click", () => {
+	closeSetMenus();
+	$("#m-role-menu").classList.add("hidden");
+});
 
 async function loadDevices() {
 	devices = await api("/api/devices");
@@ -132,6 +140,8 @@ async function loadDevices() {
 // ---------- transactions ----------
 let txns = [];
 let txQuery = "";
+let txDirection = "all";
+let txStatus = "all";
 function fmtTime(ts) {
 	return new Date(ts * 1000).toLocaleString();
 }
@@ -139,9 +149,23 @@ function fmtTime(ts) {
 function txTime(t) {
 	return t.time || (t.synced_at ? fmtTime(t.synced_at) : "");
 }
+function txDirectionOf(t) {
+	return t.direction || "deposit";
+}
+function txStatusOf(t) {
+	return t.status || "synced";
+}
+function txBadge(value, type) {
+	return `<span class="tx-badge ${type}-${value}">${value}</span>`;
+}
 function renderTransactions() {
 	const q = txQuery.toLowerCase();
-	const rows = q ? txns.filter((t) => JSON.stringify(t).toLowerCase().includes(q)) : txns;
+	const rows = txns.filter((t) => {
+		const matchesDirection = txDirection === "all" || txDirectionOf(t) === txDirection;
+		const matchesStatus = txStatus === "all" || txStatusOf(t) === txStatus;
+		const matchesSearch = !q || JSON.stringify(t).toLowerCase().includes(q);
+		return matchesDirection && matchesStatus && matchesSearch;
+	});
 	$("#tx-empty").classList.toggle("hidden", rows.length > 0);
 	$("#tx-empty").textContent = txns.length && !rows.length
 		? "No transactions match your search." : "No synced transactions yet.";
@@ -150,7 +174,10 @@ function renderTransactions() {
 		.map((t) => `
       <tr>
         <td class="mono">${txTime(t)}</td>
+		<td>${t.client_name || t.client_id || ""}</td>
         <td class="mono">${t.serial}</td>
+		<td>${txBadge(txDirectionOf(t), "direction")}</td>
+		<td>${txBadge(txStatusOf(t), "status")}</td>
         <td>${t.kind || ""}</td>
         <td>${t.type || ""}</td>
         <td class="mono">${t.from_account || ""}${t.from_name ? `<div class="muted">${t.from_name}</div>` : ""}</td>
@@ -164,6 +191,22 @@ async function loadTransactions() {
 	txns = await api("/api/transactions");
 	renderTransactions();
 }
+function upsertTransaction(transaction) {
+	if (transaction.id) {
+		const index = txns.findIndex((item) => item.id === transaction.id);
+		if (index >= 0) txns[index] = transaction;
+		else txns.push(transaction);
+	} else {
+		txns.push(transaction);
+	}
+	renderTransactions();
+}
+$$(".tx-filter").forEach((button) => button.addEventListener("click", () => {
+	txDirection = button.dataset.txDirection;
+	$$('.tx-filter').forEach((item) => item.classList.toggle("active", item === button));
+	renderTransactions();
+}));
+$("#tx-status").onchange = (e) => { txStatus = e.target.value; renderTransactions(); };
 $("#tx-search").oninput = (e) => { txQuery = e.target.value.trim(); renderTransactions(); };
 $("#tx-clear").onclick = async () => {
 	await post("/api/transactions/clear");
@@ -173,13 +216,15 @@ $("#tx-clear").onclick = async () => {
 
 // ---------- settings: gateway sets ----------
 let sets = [];
-let activeSetId = "sync";          // tab selection: a set id, "new", or "sync"
+let activeSetId = "sync";
 let defaultApi = "https://paymentgateway.108pay.co";
 
 async function loadSettings() {
 	const s = await api("/api/settings");
 	defaultApi = s.default_api_url || defaultApi;
 	$("#sync-token").placeholder = s.ngrok_token_set ? "•••••• (saved)" : "ngrok auth token";
+	$("#dm-id").value = s.device_manager_id || "";
+	$("#sync-withdraw-callback").value = s.withdraw_callback_url || "";
 	await loadSets();
 }
 
@@ -259,13 +304,19 @@ $("#set-register").onclick = async () => {
 // ---------- sync (ngrok) ----------
 async function refreshSync() {
 	const s = await api("/api/sync/status");
+	syncRunning = Boolean(s.running);
 	$("#sync-dot").className = "dot " + (s.running ? "on" : "off");
 	$("#sync-url").value = s.url || "";
 	$("#sync-url").placeholder = s.running ? "" : "(not running)";
+	renderDevices();
 }
 $("#sync-start").onclick = async () => {
 	$("#sync-url").value = "starting…";
-	const r = await post("/api/sync/start", { token: $("#sync-token").value.trim() });
+const r = await post("/api/sync/start", {
+	token: $("#sync-token").value.trim(),
+	device_manager_id: $("#dm-id").value.trim(),
+	withdraw_callback_url: $("#sync-withdraw-callback").value.trim(),
+});
 	if (r.ok) $("#sync-url").value = r.url || "";
 	else { $("#sync-url").value = ""; logLine("⚠ Sync: " + (r.error || "failed")); }
 	refreshSync();
@@ -315,13 +366,34 @@ function openModal(serial) {
 	// the plaintext password is never sent to the UI (it'd leak over Sync); show
 	// whether one is saved and keep it unless a new value is typed.
 	$("#m-pass").placeholder = d.has_creds ? "•••••• (saved — blank keeps it)" : "device password";
+	const setRole = (role) => {
+		$("#m-role").value = role;
+		$("#m-role-label").textContent = role === "withdraw" ? "Withdraw" : "Deposit";
+		$("#m-watermark-field").classList.toggle("hidden", role === "withdraw");
+		$$("#m-role-menu [data-role]").forEach((button) => {
+			button.classList.toggle("active", button.dataset.role === role);
+		});
+	};
+	setRole(d.role || "deposit");
+	$("#m-role-trigger").onclick = (event) => {
+		event.stopPropagation();
+		$("#m-role-menu").classList.toggle("hidden");
+	};
+	$$("#m-role-menu [data-role]").forEach((button) => {
+		button.onclick = () => {
+			setRole(button.dataset.role);
+			$("#m-role-menu").classList.add("hidden");
+		};
+	});
 	$("#m-ref").value = d.last_ref || "";
+	$("#m-role-menu").classList.add("hidden");
 	$("#modal").classList.remove("hidden");
 }
 $("#m-cancel").onclick = () => $("#modal").classList.add("hidden");
 $("#m-save").onclick = async () => {
 	const body = {
 		username: $("#m-user").value.trim(),
+		role: $("#m-role").value,
 		last_ref: $("#m-ref").value.trim(),
 	};
 	// only send the password if the user actually typed one, so saving other
@@ -353,7 +425,7 @@ function connectStream() {
 		const evt = JSON.parse(e.data);
 		if (evt.kind === "log") logLine(evt.data.msg);
 		else if (evt.kind === "device") loadDevices();
-		else if (evt.kind === "transaction") { txns.push(evt.data); renderTransactions(); logLine(`📩 synced ${evt.data.type} ${evt.data.amount}`); }
+		else if (evt.kind === "transaction") { upsertTransaction(evt.data); logLine(`📩 ${txStatusOf(evt.data)} ${evt.data.type} ${evt.data.amount}`); }
 		else if (evt.kind === "pair") {
 			$("#qr-status").textContent = evt.data.status || "";
 			if (evt.data.done) { setTimeout(() => $("#qr-modal").classList.add("hidden"), 1500); loadDevices(); }
@@ -376,6 +448,7 @@ async function loadVersion() {
 async function boot() {
 	try {
 		await loadSets();        // populate device-card set dropdowns up front
+		await refreshSync();     // withdrawal controls depend on this connection state
 		await loadDevices();
 		setBackend(true);
 	} catch (e) {
