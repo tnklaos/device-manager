@@ -23,6 +23,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 UI_TRANSITION_SETTLE = 0.25
 
 
+class WithdrawStepError(RuntimeError):
+    """A withdrawal UI failure annotated with the numbered flow step."""
+
+    def __init__(self, step, cause):
+        self.step = step
+        self.cause = str(cause)
+        super().__init__(f"withdraw step {step} failed: {self.cause}")
+
+
 # hide the per-child console window on Windows (0 on macOS/Linux)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -693,55 +702,84 @@ def _is_transfer_money_page_from_dump(d):
 
 
 def select_source_account_on_transfer_page(d, account_no, log=print):
+    """Find the requested source account and open it using its next-page icon.
+
+    Do not tap the ``ບັນຊີຫຼັກ`` (main account) badge: that opens the optional
+    default-account popup and does not continue the transfer. Each account
+    card has a ``nextpage`` icon on the right; tapping the icon in the matched
+    account's card opens the Receiver Account page.
+    """
     saved = _only_digits(account_no)
     if len(saved) < 8:
         raise RuntimeError("saved withdraw account number is missing or too short")
 
-    try:
-        root = ET.fromstring(d.dump_hierarchy())
-    except Exception as e:
-        raise RuntimeError(f"could not read transfer money page: {e}")
-
-    nodes = []
-    for el in root.iter():
-        text = (el.attrib.get("text") or "").strip()
-        bounds = _parse_bounds(el.attrib.get("bounds", ""))
-        if text and bounds:
-            nodes.append({"text": text, "bounds": bounds})
-
+    # The transfer page is a WebView and the source-account row can appear
+    # after the page itself has already been detected. Keep reading the UI
+    # briefly instead of treating a not-yet-rendered row as a mismatch.
+    deadline = time.time() + 8
     candidates = []
-    for node in nodes:
-        text = node["text"]
-        if not any(ch.isdigit() for ch in text):
+    nodes = []
+    while time.time() < deadline:
+        try:
+            root = ET.fromstring(d.dump_hierarchy())
+        except Exception as e:
+            time.sleep(0.5)
             continue
-        if "x" not in _norm_text(text):
-            continue
-        if _masked_account_matches(saved, text):
-            candidates.append(node)
+
+        nodes = []
+        for el in root.iter():
+            text = (el.attrib.get("text") or "").strip()
+            bounds = _parse_bounds(el.attrib.get("bounds", ""))
+            if text and bounds:
+                nodes.append({"text": text, "bounds": bounds})
+
+        candidates = []
+        for node in nodes:
+            text = node["text"]
+            if not any(ch.isdigit() for ch in text):
+                continue
+            normalized = _norm_text(text)
+            # Normal BCEL rows are masked; accept an exact unmasked account as
+            # well for app versions that expose the full number in the UI.
+            if ("x" not in normalized and _only_digits(text) != saved):
+                continue
+            if _masked_account_matches(saved, text) or _only_digits(text) == saved:
+                candidates.append(node)
+        if candidates:
+            break
+        time.sleep(0.5)
 
     if not candidates:
         raise RuntimeError(f"transfer source account mismatch for saved account ending {saved[-4:]}")
 
     number = sorted(candidates, key=lambda n: n["bounds"][1])[0]
     nx1, ny1, nx2, ny2 = number["bounds"]
-    related = [number]
+    number_y = (ny1 + ny2) // 2
+    next_icons = []
     for node in nodes:
-        text = node["text"]
-        if not text:
+        if _norm_text(node["text"]) != "nextpage":
             continue
         x1, y1, x2, y2 = node["bounds"]
-        if y1 < ny1 - 140 or y2 > ny2 + 160:
+        # Only accept the right-side arrow that shares the account-number row.
+        # This deliberately excludes the left-side main-account badge and all
+        # labels/buttons below the account number.
+        if x1 <= nx2 + 60:
             continue
-        if x2 < nx1 - 220 or x1 > nx2 + 260:
+        if x1 < 500:
             continue
-        related.append(node)
-    row_bounds = (
-        min(n["bounds"][0] for n in related),
-        min(n["bounds"][1] for n in related),
-        max(n["bounds"][2] for n in related),
-        max(n["bounds"][3] for n in related),
-    )
-    cx, cy = _center(row_bounds)
+        if y1 > ny2 + 35 or y2 < ny1 - 35:
+            continue
+        next_icons.append(node)
+    if not next_icons:
+        raise RuntimeError(
+            f"transfer source account next-page button not found for account ending {saved[-4:]}"
+        )
+
+    # The nextpage icon is the only navigation control for this account card.
+    # It is intentionally used instead of the main-account badge or other text
+    # in the card, which could open the set-main-account popup.
+    next_icon = min(next_icons, key=lambda node: abs(_center(node["bounds"])[1] - number_y))
+    cx, cy = _center(next_icon["bounds"])
     screen_prefix, screen_suffix = _masked_visible_parts(number["text"])
     log(
         f"matched transfer source account: "
@@ -750,6 +788,7 @@ def select_source_account_on_transfer_page(d, account_no, log=print):
         f"saved_suffix_match={'yes' if saved.endswith(screen_suffix) else 'no'} "
         f"screen={number['text']}"
     )
+    log(f"open source account card: account={number['text']!r} x={cx}, y={cy}")
     d.click(cx, cy)
     # The caller verifies the receiver page immediately afterwards, so do not
     # pay a blind one-second delay after a successful tap.
@@ -1181,36 +1220,173 @@ def check_transfer_result_modal(d, log=print, timeout=6):
     return False
 
 
-def open_withdraw_transfer_page(d, card_no, log=print):
-    """Open Transfer Money from the BCEL One home/card services menu.
+def open_withdraw_unionpay_card_detail(d, card_no, log=print):
+    """Step 1: Open and verify the configured UnionPay Card Detail page only.
 
-    On current BCEL One builds, tapping the UnionPay card number opens the ATM
-    cash-withdrawal amount page, not bank transfer.  The ``ໂອນເງິນ`` service
-    shown on the home card is the correct route for an account transfer.
-    ``card_no`` remains in the function signature for compatibility with the
-    configured device data, but is not used to select the transfer route.
+    This step starts at Card/Home, clicks the configured UnionPay card number,
+    and stops after the UnionPay Card Detail page is verified. It does not tap
+    Transfer or enter any transaction data.
     """
-    go_home(d, log=log)
+    prepare_withdraw_start_page(d, log=log)
+    if transfer_menu_visible(d):
+        saved = _only_digits(card_no)
+        if len(saved) < 10:
+            raise RuntimeError("withdraw card number is missing on UnionPay Card Detail page")
+        verify_unionpay_card_detail(d, saved, log=log)
+        log("step 1 complete: UnionPay Card Detail is already open")
+    elif len(_only_digits(card_no)) >= 10:
+        select_unionpay_card(d, card_no, log=log, open_transfer=False)
+    else:
+        raise RuntimeError("withdraw card number is missing")
+
+
+def open_withdraw_transfer_money_page(d, card_no, log=print):
+    """Step 2: From UnionPay Card Detail, tap Transfer and verify Transfer Money.
+
+    This step does not select a source account, enter a destination account,
+    press Next, or submit a transfer.
+    """
+    saved = _only_digits(card_no)
+    if len(saved) >= 10:
+        verify_unionpay_card_detail(d, saved, log=log)
     click_transfer_on_unionpay_detail(d, log=log)
     verify_transfer_money_page(d, log=log)
 
 
-def complete_withdraw_receiver_page(d, source_account, to_account, log=print):
-    """Select the source account and submit the receiver account page."""
+def open_withdraw_transfer_page(d, card_no, log=print):
+    """Compatibility helper: run card-detail step then Transfer Money step."""
+    open_withdraw_unionpay_card_detail(d, card_no, log=log)
+    open_withdraw_transfer_money_page(d, card_no, log=log)
+
+
+def prepare_new_withdraw_request(d, card_no, log=print):
+    """Normalize BCEL One before processing a new withdrawal request.
+
+    A new request must never continue an old transfer's Receiver, Amount,
+    Security, Description, Confirm, or Result page. The only nested page that
+    is safe to reuse is the verified UnionPay Card Detail page for ``card_no``.
+    All other states return to Card/Home so the new request starts at Step 1.
+    """
+    if at_login(d):
+        raise RuntimeError("BCEL One is on the login screen before a new withdraw request")
+
+    saved = _only_digits(card_no)
+    if len(saved) >= 10:
+        try:
+            verify_unionpay_card_detail(d, saved, log=log, timeout=0.5)
+            log("new withdraw request: reuse verified UnionPay Card Detail")
+            return d
+        except Exception:
+            pass
+
+    # Any page other than the configured card detail is normalized to the safe
+    # Card/Home start state. This clears abandoned transaction pages so values
+    # from a prior request cannot be reused by mistake.
+    log("new withdraw request: reset current page to Card/Home")
+    if not go_home(d, log=log):
+        raise RuntimeError("BCEL One could not return to Card/Home for a new withdraw request")
+    prepare_withdraw_start_page(d, log=log)
+    log("new withdraw request: Card/Home ready for Step 1")
+    return d
+
+
+def transfer_menu_visible(d):
+    """Return whether the current rendered page already exposes Transfer."""
+    for label in ("ໂອນເງິນ", "Transfer"):
+        try:
+            if d(text=label).exists:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def prepare_withdraw_start_page(d, log=print, render_wait=2.0):
+    """Put BCEL One on a stable dashboard before starting withdrawal UI.
+
+    BCEL One reuses ``MainActivity`` for Home, Card list, and Card detail, so
+    activity name alone is not enough to identify the current page. Give the
+    WebView time to render, use the Card tab when visible, and back out of any
+    nested page before continuing.
+    """
+    time.sleep(render_wait)
+    if at_login(d):
+        raise RuntimeError("BCEL One is still on login screen after connect")
+
+    # Card/Home page: the safe starting page where the Card tab or Transfer
+    # service is available before the withdrawal flow begins.
+    for attempt in range(5):
+        if d.app_current().get("package") != PKG:
+            d.app_start(PKG, stop=False)
+            time.sleep(2.0)
+            continue
+
+        # A visible Card tab means the dashboard tabs are rendered. Select it
+        # explicitly because Transfer is exposed from the card services view
+        # on some BCEL One versions.
+        if transfer_menu_visible(d):
+            log("withdraw start page: Transfer menu already visible")
+            return d
+        card_tab = d(text="ບັດ")
+        if card_tab.exists:
+            try:
+                card_tab.click()
+                time.sleep(render_wait)
+                log("withdraw start page: opened Card tab")
+                return d
+            except Exception:
+                pass
+
+        # If this is a nested Card detail/another page, back out and wait for
+        # the dashboard to render instead of searching a stale hierarchy.
+        if is_home(d):
+            time.sleep(render_wait)
+            return d
+        log(f"withdraw start page: backing to home ({attempt + 1}/5)")
+        d.press("back")
+        time.sleep(render_wait)
+
+    if not is_home(d):
+        raise RuntimeError("BCEL One could not return to a usable home/card page")
+    return d
+
+
+def complete_withdraw_source_account_page(d, source_account, log=print):
+    """เลือกบัญชีต้นทางและยืนยันว่าแอปเปลี่ยนไปหน้า Receiver Account แล้ว."""
     select_source_account_on_transfer_page(d, source_account, log=log)
     verify_receiver_account_page(d, log=log)
+
+
+def complete_withdraw_destination_account_page(d, to_account, log=print):
+    """กรอกบัญชีปลายทางในหน้า Receiver Account แล้วกด Next."""
     input_receiver_account(d, to_account, log=log)
+    click_receiver_next(d, log=log)
+
+
+def complete_withdraw_receiver_page(d, source_account, to_account, log=print):
+    """Compatibility wrapper: ทำขั้นบัญชีต้นทางและปลายทางต่อเนื่องกัน."""
+    complete_withdraw_source_account_page(d, source_account, log=log)
+    complete_withdraw_destination_account_page(d, to_account, log=log)
+
+
+def verify_withdraw_amount_page(d, source_account, to_account, to_name, log=print):
+    """Step 5: Verify transfer parties on the Amount page without changing it."""
+    verify_transfer_amount_page(
+        d, source_account, to_account, to_name, log=log
+    )
+
+
+def complete_withdraw_amount_entry_page(d, amount, log=print):
+    """Step 6: Enter the transfer amount and press Next on the Amount page."""
+    input_transfer_amount(d, amount, log=log)
     click_receiver_next(d, log=log)
 
 
 def complete_withdraw_amount_page(
         d, source_account, to_account, to_name, amount, log=print):
-    """Verify the transfer parties, enter the amount, and continue."""
-    verify_transfer_amount_page(
-        d, source_account, to_account, to_name, log=log
-    )
-    input_transfer_amount(d, amount, log=log)
-    click_receiver_next(d, log=log)
+    """Compatibility helper: verify parties, enter amount, and press Next."""
+    verify_withdraw_amount_page(d, source_account, to_account, to_name, log=log)
+    complete_withdraw_amount_entry_page(d, amount, log=log)
 
 
 def complete_withdraw_security_pages(d, security_answers, log=print):
@@ -1240,20 +1416,38 @@ def complete_withdraw_result_page(d, log=print):
 def run_withdraw_flow(
         d, card_no, source_account, to_account, to_name, amount,
         security_answers, remark="", log=print):
-    """Run the BCEL withdrawal UI flow from card selection through result."""
-    open_withdraw_transfer_page(d, card_no, log=log)
-    complete_withdraw_receiver_page(
-        d, source_account, to_account, log=log
+    """Run the BCEL One transfer flow from card selection through result handling.
+
+    The steps below identify the action and relevant app page on each line,
+    making the flow easier to inspect and debug.
+
+    Do not skip account selection, destination entry, amount entry, or final
+    confirmation: they affect a financial transaction. The security step runs
+    only when the app shows a question; remark is optional.
+    """
+
+    steps = (
+        (1, lambda: open_withdraw_unionpay_card_detail(d, card_no, log=log)),
+        (2, lambda: open_withdraw_transfer_money_page(d, card_no, log=log)),
+        (3, lambda: complete_withdraw_source_account_page(d, source_account, log=log)),
+        (4, lambda: complete_withdraw_destination_account_page(d, to_account, log=log)),
+        (5, lambda: verify_withdraw_amount_page(d, source_account, to_account, to_name, log=log)),
+        (6, lambda: complete_withdraw_amount_entry_page(d, amount, log=log)),
+        (7, lambda: complete_withdraw_security_pages(d, security_answers, log=log)),
+        (8, lambda: complete_withdraw_description_page(d, remark, log=log)),
+        (9, lambda: complete_withdraw_confirmation_page(d, source_account, to_account, to_name, log=log)),
+        (10, lambda: complete_withdraw_result_page(d, log=log)),
     )
-    complete_withdraw_amount_page(
-        d, source_account, to_account, to_name, amount, log=log
-    )
-    complete_withdraw_security_pages(d, security_answers, log=log)
-    complete_withdraw_description_page(d, remark, log=log)
-    complete_withdraw_confirmation_page(
-        d, source_account, to_account, to_name, log=log
-    )
-    return complete_withdraw_result_page(d, log=log)
+    for step, action in steps:
+        try:
+            result = action()
+            if step == 10 and not result:
+                raise RuntimeError("transfer result was not detected")
+        except WithdrawStepError:
+            raise
+        except Exception as exc:
+            raise WithdrawStepError(step, exc) from exc
+    return True
 
 
 def recover_to_bcel_home(d, log=print, tries=3):
@@ -1436,11 +1630,6 @@ def input_transfer_amount(d, amount, log=print, timeout=8):
 
 def input_security_answer(d, answer, log=print, timeout=8):
     field_specs = _security_answer_field_specs(answer)
-    active_specs = [spec for spec in field_specs if spec["answer"]]
-    if not active_specs:
-        raise RuntimeError("security answer 1 is missing in device credentials")
-
-    candidate_norms = tuple(_norm_text(label) for spec in active_specs for label in spec["labels"])
     last_seen = []
     filled_indexes = set()
     flow_deadline = time.time() + max(timeout, 8) * 4
@@ -1466,15 +1655,18 @@ def input_security_answer(d, answer, log=print, timeout=8):
             if filled_indexes:
                 log("security answers done")
                 return True
+            log("security question page not shown — skip step 7")
             return False
 
-        current_index = _detect_security_question_index(nodes, active_specs)
+        # Only require saved answers after confirming that the app is actually
+        # displaying a Security Question page. Some transfers skip this page.
+        current_index = _detect_security_question_index(nodes, field_specs)
         if current_index is None:
             time.sleep(0.5)
             continue
 
-        spec = next((item for item in active_specs if item["index"] == current_index), None)
-        if not spec:
+        spec = next((item for item in field_specs if item["index"] == current_index), None)
+        if not spec or not spec["answer"]:
             raise RuntimeError(f"security answer {current_index} is required but missing in device credentials")
         answer_value = spec["answer"]
         spec_norms = tuple(_norm_text(label) for label in spec["labels"])
@@ -1499,7 +1691,7 @@ def input_security_answer(d, answer, log=print, timeout=8):
                 except Exception:
                     time.sleep(0.5)
                     continue
-                next_index = _detect_security_question_index(next_nodes, active_specs)
+                next_index = _detect_security_question_index(next_nodes, field_specs)
                 if not _is_security_answer_page(next_nodes):
                     log("security answers done")
                     return True
@@ -1572,7 +1764,7 @@ def input_security_answer(d, answer, log=print, timeout=8):
             except Exception:
                 time.sleep(0.5)
                 continue
-            next_index = _detect_security_question_index(next_nodes, active_specs)
+            next_index = _detect_security_question_index(next_nodes, field_specs)
             if not _is_security_answer_page(next_nodes):
                 log("security answers done")
                 return True
@@ -1687,8 +1879,12 @@ def input_transfer_description(d, remark, log=print, timeout=8):
 
 
 def click_transfer_on_unionpay_detail(d, log=print, timeout=8):
+    # UnionPay Card Detail page: this is the card-specific services page. Tap
+    # its Transfer service to open the Transfer Money page; do not select an
+    # account or enter any transfer details in this helper.
     targets = ("ໂອນເງິນ", "Transfer")
     deadline = time.time() + timeout
+    backed_out_of_card_detail = False
     while time.time() < deadline:
         try:
             nodes = _collect_hierarchy_nodes(d)
@@ -1710,6 +1906,17 @@ def click_transfer_on_unionpay_detail(d, log=print, timeout=8):
             candidates.append(node)
 
         if not candidates:
+            # MainActivity is shared by Home, Card list, and Card detail. If
+            # the transfer service is not visible, the current page may be a
+            # card detail page left open by the previous operation. Back out
+            # once and continue searching instead of failing immediately.
+            if not backed_out_of_card_detail and time.time() + 1.0 >= deadline:
+                log("transfer menu not visible — leaving current card detail page")
+                d.press("back")
+                backed_out_of_card_detail = True
+                time.sleep(UI_TRANSITION_SETTLE)
+                deadline = time.time() + timeout
+                continue
             time.sleep(0.5)
             continue
 
@@ -1718,24 +1925,23 @@ def click_transfer_on_unionpay_detail(d, log=print, timeout=8):
         tx1, ty1, tx2, ty2 = target_node["bounds"]
         cx = int((tx1 + tx2) / 2)
         cy = int((ty1 + ty2) / 2)
-        text_h = max(ty2 - ty1, 1)
-
-        for tap_y, label in (
-            (cy, "clicking transfer text"),
-            (max(ty1 - int(text_h * 1.2), 0), "clicking slightly above transfer text"),
-        ):
-            log(f"{label}: {target_node['text']}")
-            d.click(cx, tap_y)
-            time.sleep(UI_TRANSITION_SETTLE)
-            if _is_transfer_money_page_from_dump(d):
-                return True
-
-        time.sleep(0.5)
+        # Step 2 must perform one intentional tap only: the Transfer text on
+        # the UnionPay Card Detail page. The caller verifies the next page,
+        # rather than retrying at a nearby coordinate that could hit another UI.
+        log(f"click Transfer once: {target_node['text']}")
+        d.click(cx, cy)
+        time.sleep(UI_TRANSITION_SETTLE)
+        return True
 
     raise RuntimeError("transfer menu 'ໂອນເງິນ' / 'Transfer' not found on UnionPay detail page")
 
 
-def select_unionpay_card(d, card_no, log=print):
+def select_unionpay_card(d, card_no, log=print, open_transfer=True):
+    """Open the matched UnionPay Card Detail page.
+
+    When ``open_transfer`` is False, stop on Card Detail for step-by-step
+    control. The default True preserves the original convenience behavior.
+    """
     saved = _only_digits(card_no)
     if len(saved) < 10:
         log("withdraw card select skipped — no saved card number")
@@ -1794,7 +2000,8 @@ def select_unionpay_card(d, card_no, log=print):
             d.click(tcx, tcy)
             time.sleep(0.8)
         verify_unionpay_card_detail(d, saved, log=log)
-        click_transfer_on_unionpay_detail(d, log=log)
+        if open_transfer:
+            click_transfer_on_unionpay_detail(d, log=log)
         return True
 
     raise RuntimeError(f"UnionPay card number mismatch for saved card ending {saved[-4:]}")

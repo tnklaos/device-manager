@@ -172,6 +172,9 @@ nav { display: flex; flex-direction: column; gap: 4px; }
   border-radius: 9px; padding: 10px 12px; font-size: 13px; outline: none;
 }
 .card input:focus, .card select:focus, .modal input:focus { border-color: var(--indigo); }
+.sensitive-input { display: flex; gap: 8px; align-items: center; }
+.sensitive-input input { min-width: 0; flex: 1; }
+.sensitive-input .btn { flex: 0 0 58px; }
 .role-picker { position: relative; }
 .role-trigger { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--bg); color: var(--text); font-size: 13px; cursor: pointer; }
 .role-trigger:hover, .role-trigger:focus { border-color: var(--indigo); }

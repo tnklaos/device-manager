@@ -7,6 +7,7 @@ transactions) to subscribers for the UI's SSE stream.
 """
 import os
 import json
+import re
 import time
 import uuid
 import queue
@@ -123,12 +124,64 @@ def device_state(serial):
     return None
 
 
+_UNSET = object()   # "argument not supplied" — None is a real adb state here
+
 # human-readable reason a device isn't usable, keyed by adb state
 _STATE_REASON = {
     "unauthorized": "unauthorized — tap Allow (USB debugging) on the phone, then Start again",
     "offline": "offline — unplug/replug or reconnect the device",
     None: "not connected",
 }
+
+
+# ---------- withdraw rejection catalog ----------
+# errorCode -> (HTTP status, retryable, Retry-After seconds)
+#
+# The caller (CSL Payment) keys its handling off ``errorCode``/``retryable``;
+# the HTTP status is chosen so that a client which only looks at the status
+# still does the right thing.  4xx means "this request will never succeed as
+# sent"; 503 means "the request is fine, we just can't serve it right now".
+WITHDRAW_ERRORS = {
+    "INVALID_REQUEST":            (400, False, 0),
+    "UNAUTHORIZED":               (401, False, 0),
+    "DUPLICATE_REQUEST_ID":       (409, False, 0),
+    "DUPLICATE_WITHDRAWAL_ID":    (409, False, 0),
+    "DEVICE_NOT_ASSIGNED":        (422, False, 0),
+    "MULTIPLE_DEVICES_ASSIGNED":  (422, False, 0),
+    # Return an HTTP 200 so CSL Payment can always consume the JSON result.
+    # The body still reports that the withdrawal was rejected and must not be
+    # retried automatically.
+    "DEVICE_NOT_CONNECTED":       (200, False, 0),
+    "DEVICE_NOT_STARTED":         (503, True, 30),
+    "DEVICE_BUSY":                (503, True, 10),
+    "CALLBACK_NOT_CONFIGURED":    (503, False, 0),
+    "SIGNING_KEY_NOT_CONFIGURED": (503, False, 0),
+}
+
+
+def withdraw_error(error_code, message, **extra):
+    """Build one withdraw rejection body from the catalog above.
+
+    ``code`` and ``retryAfter`` are consumed by the HTTP layer (server.py) and
+    never reach the JSON body.
+    """
+    status, retryable, retry_after = WITHDRAW_ERRORS.get(error_code, (409, False, 0))
+    body = {
+        "ok": False,
+        "accepted": False,
+        "status": "FAILED",
+        "errorCode": error_code,
+        "message": message,
+        "retryable": retryable,
+        "code": status,
+    }
+    if retry_after:
+        body["retryAfter"] = retry_after
+    body.update(extra)
+    # Every rejected withdraw request has a terminal failure status, even if
+    # extra metadata contains a previous transaction status.
+    body["status"] = "FAILED"
+    return body
 
 
 def source_account(t):
@@ -237,30 +290,71 @@ class Engine:
         }
         return legacy_urls.pop() if len(legacy_urls) == 1 else ""
 
+    def _withdraw_device_info(self, serial, adb_state=_UNSET):
+        """Report one withdraw device the way the caller sees it: is it plugged
+        in (``connected``) and is the monitor running (``started``)."""
+        if adb_state is _UNSET:
+            adb_state = device_state(serial)
+        return {
+            "serial": serial,
+            "connected": adb_state == "device",
+            "adbState": adb_state or "not_found",
+            "started": bool(self._monitors.get(serial, {}).get("active")),
+        }
+
     def _withdraw_target(self, client_id):
+        """Resolve the ready-to-use withdraw device for ``client_id``.
+
+        Returns ``(target, None)`` when the device can take the job, otherwise
+        ``(None, error)`` where error is a ``withdraw_error`` body.
+        """
         matches = [
             serial for serial, dev in self.settings.get("devices", {}).items()
             if dev.get("role") == "withdraw"
             and (self.settings.get("sets", {}).get(dev.get("set"), {}).get("client_id") or "") == client_id
         ]
         if not matches:
-            return None, f"clientId {client_id} has no assigned withdraw device"
+            return None, withdraw_error(
+                "DEVICE_NOT_ASSIGNED",
+                f"clientId {client_id} has no assigned withdraw device")
         if len(matches) > 1:
-            return None, f"clientId {client_id} has more than one assigned withdraw device"
+            return None, withdraw_error(
+                "MULTIPLE_DEVICES_ASSIGNED",
+                f"clientId {client_id} has more than one assigned withdraw device")
         serial = matches[0]
         creds = self.device_creds(serial)
         if creds.get("role") != "withdraw":
-            return None, f"client {client_id} is not assigned to a withdraw device"
-        if not self._monitors.get(serial, {}).get("active"):
-            return None, f"withdraw device {serial} is not started"
+            return None, withdraw_error(
+                "DEVICE_NOT_ASSIGNED",
+                f"client {client_id} is not assigned to a withdraw device")
+
+        # Cable first, then monitor: "unplugged" and "plugged in but not
+        # started" need different fixes, so they get different error codes.
+        adb_state = device_state(serial)
+        device_info = self._withdraw_device_info(serial, adb_state)
+        if adb_state != "device":
+            return None, withdraw_error(
+                "DEVICE_NOT_CONNECTED",
+                f"withdraw device {serial} is {_STATE_REASON.get(adb_state, adb_state)}",
+                device=device_info)
+        if not device_info["started"]:
+            return None, withdraw_error(
+                "DEVICE_NOT_STARTED",
+                f"withdraw device {serial} is not started",
+                device=device_info)
+
         gateway_set = self.settings.get("sets", {}).get(creds.get("set"), {})
         callback_url = self._withdraw_callback_url()
         parsed_callback = urlparse(callback_url)
         if parsed_callback.scheme not in {"http", "https"} or not parsed_callback.netloc:
-            return None, "Withdrawal Callback URL is not configured"
+            return None, withdraw_error(
+                "CALLBACK_NOT_CONFIGURED",
+                "Withdrawal Callback URL is not configured", device=device_info)
         callback_secret = (gateway_set.get("api_key") or "").strip()
         if not callback_secret:
-            return None, "Withdrawal Callback Secret Key is not configured"
+            return None, withdraw_error(
+                "CALLBACK_NOT_CONFIGURED",
+                "Withdrawal Callback Secret Key is not configured", device=device_info)
         set_name = gateway_set.get("name", client_id)
         return {
             "id": client_id,
@@ -268,20 +362,22 @@ class Engine:
             "serial": serial,
             "callback_url": callback_url,
             "callback_secret": callback_secret,
-        }, ""
+        }, None
 
     def verify_withdraw_signature(self, client_id, raw_body, supplied_signature):
         """Verify a withdraw request with the matching Gateway Set's Secret Key.
 
         ``raw_body`` must be the original HTTP bytes.  Never JSON-serialize it
         again here: even harmless whitespace changes would change the HMAC.
+
+        Returns ``(ok, message, error_code)``.
         """
         client_id = str(client_id or "").strip()
         supplied_signature = str(supplied_signature or "").strip()
         if not client_id:
-            return False, "clientId is required", 400
+            return False, "clientId is required", "INVALID_REQUEST"
         if not supplied_signature:
-            return False, "Unauthorized", 401
+            return False, "Unauthorized", "UNAUTHORIZED"
 
         matches = [
             gateway_set for gateway_set in self.settings.get("sets", {}).values()
@@ -289,17 +385,17 @@ class Engine:
         ]
         if len(matches) != 1:
             # Do not reveal whether a particular clientId is configured.
-            return False, "Unauthorized", 401
+            return False, "Unauthorized", "UNAUTHORIZED"
         secret = (matches[0].get("api_key") or "").strip()
         if not secret:
-            return False, "Withdrawal signing key is not configured", 503
+            return False, "Withdrawal signing key is not configured", "SIGNING_KEY_NOT_CONFIGURED"
 
         expected = hmac.new(
             secret.encode("utf-8"), raw_body, hashlib.sha256
         ).hexdigest()
         if not hmac.compare_digest(expected, supplied_signature):
-            return False, "Unauthorized", 401
-        return True, "", 200
+            return False, "Unauthorized", "UNAUTHORIZED"
+        return True, "", ""
 
     def _record_withdraw_transaction(self, record):
         """Keep a withdraw record in the same in-memory activity list as deposits."""
@@ -329,6 +425,10 @@ class Engine:
         """Map internal BCEL/device failures to stable callback error codes."""
         raw_error = str(raw_error or "Unknown withdrawal error")
         text = raw_error.lower()
+        step_match = re.search(r"withdraw step (10|[1-9]) failed", text)
+        if step_match:
+            step = int(step_match.group(1))
+            return f"BCEL_STEP_{step}_FAILED", f"BCEL One withdrawal step {step} failed"
         if any(token in text for token in (
             "input not found", "page verification failed", "automation failed",
             "xpath", "unexpected ui",
@@ -352,11 +452,23 @@ class Engine:
             return "SECURITY_ANSWER_FAILED", "BCEL One security answer failed"
         return "BCEL_UI_UNEXPECTED", "BCEL One automation failed"
 
+    @staticmethod
+    def _withdraw_callback_error_number(error_code):
+        """Return the zero-padded failed UI-step code for callback rawError.
+
+        ``001`` through ``010`` identify failures in withdrawal steps 1 through
+        10. Failures before the flow starts, or failures that cannot be tied to
+        a step, use ``000``.
+        """
+        match = re.fullmatch(r"BCEL_STEP_(10|[1-9])_FAILED", str(error_code))
+        return f"{int(match.group(1)):03d}" if match else "000"
+
     def _send_withdraw_callback(self, transaction_id, callback_url, callback_secret,
                                 status, raw_error=""):
-        """POST one terminal withdrawal result to CSL Payment, retrying delivery.
+        """POST one terminal withdrawal result to CSL Payment once.
 
-        A retry only repeats this callback; it never runs the BCEL transfer again.
+        UI actions may retry internally, but the terminal callback must never be
+        sent more than once for the same withdrawal result.
         """
         record = next((item for item in reversed(self.transactions)
                        if item.get("id") == transaction_id), None)
@@ -374,10 +486,20 @@ class Engine:
         }
         if status == "FAILED":
             code, message = self._withdraw_callback_error(raw_error)
+            if isinstance(raw_error, dict):
+                raw_error_json = dict(raw_error)
+            else:
+                raw_error_json = {
+                    "type": type(raw_error).__name__ if raw_error else "RuntimeError",
+                    "message": str(raw_error or "Unknown withdrawal error"),
+                }
+            # Keep the descriptive error.code while supplying CSL's requested
+            # zero-padded numeric code in the raw error object.
+            raw_error_json["errorCode"] = self._withdraw_callback_error_number(code)
             payload["error"] = {
                 "code": code,
                 "message": message,
-                "rawError": str(raw_error or "Unknown withdrawal error"),
+                "rawError": raw_error_json,
             }
         raw_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         signature = hmac.new(
@@ -386,33 +508,30 @@ class Engine:
         ).hexdigest()
 
         last_error = ""
-        for attempt, delay in enumerate((0, 1, 3), start=1):
-            if delay:
-                time.sleep(delay)
-            try:
-                response = requests.post(
-                    callback_url,
-                    data=raw_body.encode("utf-8"),
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Signature": signature,
-                    },
-                    timeout=15,
-                )
-                if 200 <= response.status_code < 300:
-                    self._update_withdraw_transaction(
-                        transaction_id, callback_status="sent",
-                        callback_sent_at=time.time(),
-                    )
-                    self.log(f"✓ withdrawal callback sent: requestId={payload['requestId']} status={status}")
-                    return
-                last_error = f"HTTP {response.status_code}"
-            except Exception as exc:
-                last_error = str(exc)
-            self.log(
-                f"⚠ withdrawal callback attempt {attempt}/3 failed: "
-                f"requestId={payload['requestId']} {last_error}"
+        try:
+            response = requests.post(
+                callback_url,
+                data=raw_body.encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Signature": signature,
+                },
+                timeout=15,
             )
+            if 200 <= response.status_code < 300:
+                self._update_withdraw_transaction(
+                    transaction_id, callback_status="sent",
+                    callback_sent_at=time.time(),
+                )
+                self.log(f"✓ withdrawal callback sent: requestId={payload['requestId']} status={status}")
+                return
+            last_error = f"HTTP {response.status_code}"
+        except Exception as exc:
+            last_error = str(exc)
+        self.log(
+            f"✗ withdrawal callback failed (single attempt): "
+            f"requestId={payload['requestId']} {last_error}"
+        )
         self._update_withdraw_transaction(
             transaction_id, callback_status="failed", callback_error=last_error,
         )
@@ -452,6 +571,12 @@ class Engine:
                 creds.get("username", "") or "",
                 log=device_log,
                 fresh=False,
+            )
+            # A new API request must not continue a partially completed prior
+            # transfer. Reuse only the verified configured UnionPay Card Detail;
+            # every other BCEL page is normalized to Card/Home before Step 1.
+            bcel.prepare_new_withdraw_request(
+                d, creds.get("card_no", "") or "", log=device_log
             )
             completed = bcel.run_withdraw_flow(
                 d,
@@ -524,14 +649,11 @@ class Engine:
         if not request_id:
             msg = "requestId is required"
             self.log(f"⚠ withdraw request rejected: {msg}")
-            return {"ok": False, "accepted": False, "message": msg, "code": 400}
+            return withdraw_error("INVALID_REQUEST", msg)
         if not withdrawal_id:
             msg = "withdrawalId is required"
             self.log(f"⚠ withdraw request rejected: {msg}")
-            return {
-                "ok": False, "accepted": False, "message": msg,
-                "requestId": request_id, "code": 400,
-            }
+            return withdraw_error("INVALID_REQUEST", msg, requestId=request_id)
 
         duplicate = next((record for record in reversed(self.transactions)
                           if record.get("direction") == "withdraw"
@@ -540,13 +662,11 @@ class Engine:
         if duplicate:
             msg = f"requestId {request_id} was already received"
             self.log(f"⚠ withdraw request rejected: {msg}")
-            return {
-                "ok": False, "accepted": False, "message": msg,
-                "withdrawalId": duplicate.get("ref", withdrawal_id),
-                "requestId": request_id,
-                "status": self._withdraw_api_status(duplicate),
-                "code": 409,
-            }
+            return withdraw_error(
+                "DUPLICATE_REQUEST_ID", msg,
+                withdrawalId=duplicate.get("ref", withdrawal_id),
+                requestId=request_id,
+                status=self._withdraw_api_status(duplicate))
 
         duplicate = next((record for record in reversed(self.transactions)
                           if record.get("direction") == "withdraw"
@@ -555,19 +675,25 @@ class Engine:
         if duplicate:
             msg = f"withdrawalId {withdrawal_id} was already received"
             self.log(f"⚠ withdraw request rejected: {msg}")
-            return {
-                "ok": False, "accepted": False, "message": msg,
-                "withdrawalId": withdrawal_id,
-                "requestId": request_id,
-                "status": self._withdraw_api_status(duplicate),
-                "code": 409,
-            }
+            return withdraw_error(
+                "DUPLICATE_WITHDRAWAL_ID", msg,
+                withdrawalId=withdrawal_id,
+                requestId=request_id,
+                status=self._withdraw_api_status(duplicate))
 
-        target, target_error = self._withdraw_target(client_id) if client_id else (None, "clientId is required")
-        active = target["serial"] if target else "-"
+        if client_id:
+            target, target_error = self._withdraw_target(client_id)
+        else:
+            target, target_error = None, withdraw_error(
+                "INVALID_REQUEST", "clientId is required")
+        # The device we resolved for this clientId, whether or not it's usable —
+        # logging "-" for a device that exists but is stopped hides the cause.
+        resolved = (target or {}).get("serial") or \
+            ((target_error or {}).get("device") or {}).get("serial") or "-"
         started = "yes" if snapshot.get("has_started_device") else "no"
         self.log(f"↘ withdraw request from {source}: {summary}")
-        self.log(f"   device activity: started={started} active_withdraw_device={active}")
+        self.log(f"   device activity: started={started} withdraw_device={resolved} "
+                 f"active_withdraw_device={snapshot.get('active_withdraw_device') or '-'}")
         for d in snapshot.get("devices", []):
             self.log(
                 f"   device {d.get('serial')}: role={d.get('role')} "
@@ -584,12 +710,12 @@ class Engine:
                         "request": payload,
                         "deviceActivity": snapshot,
                         "rejected": True,
+                        "errorCode": "DEVICE_BUSY",
                         "message": msg,
                     }, source)
-                    return {
-                        "ok": False, "accepted": False, "message": msg,
-                        "requestId": request_id, "code": 409,
-                    }
+                    return withdraw_error(
+                        "DEVICE_BUSY", msg, requestId=request_id,
+                        device=self._withdraw_device_info(serial, "device"))
                 self._withdraw_prepare_serials.add(target["serial"])
             transaction_id = f"withdraw:{uuid.uuid4()}"
             self._record_withdraw_transaction({
@@ -619,18 +745,16 @@ class Engine:
                 daemon=True,
             ).start()
         else:
-            msg = target_error
-            self.log(f"⚠ withdraw request received but {msg}")
+            self.log(f"⚠ withdraw request received but {target_error['message']} "
+                     f"[{target_error['errorCode']}]")
             self.debug("POST /api/withdraws", {
                 "request": payload,
                 "deviceActivity": snapshot,
                 "rejected": True,
-                "message": msg,
+                "errorCode": target_error["errorCode"],
+                "message": target_error["message"],
             }, source)
-            return {
-                "ok": False, "accepted": False, "message": msg,
-                "requestId": request_id, "code": 409,
-            }
+            return dict(target_error, requestId=request_id)
         self.debug("POST /api/withdraws", {
             "request": payload,
             "deviceActivity": snapshot,

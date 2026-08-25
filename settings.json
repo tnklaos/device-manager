@@ -61,5 +61,6 @@
     "202606251056844",
     "20260625510633"
   ],
-  "device_manager_id": "dm-internal-test"
+  "device_manager_id": "dm-internal-test",
+  "withdraw_callback_url": "http://localhost:9123/api/withdrawals/callback"
 }

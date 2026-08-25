@@ -136,34 +136,42 @@ def transactions_clear():
     return jsonify(ok=True)
 
 
+def _withdraw_response(res):
+    """Serialize one withdraw result: ``code``/``retryAfter`` drive the HTTP
+    envelope, everything else is the JSON body."""
+    status = int(res.pop("code", 200))
+    retry_after = res.pop("retryAfter", 0)
+    resp = jsonify(**res, received_at=time.time())
+    resp.status_code = status
+    if retry_after:
+        resp.headers["Retry-After"] = str(int(retry_after))
+    return resp
+
+
 @app.post("/api/withdraws")
 def withdraws_create():
     raw_body = request.get_data(cache=True)
     try:
         b = json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return jsonify(ok=False, accepted=False, message="Request body must be valid JSON"), 400
+        return _withdraw_response(engine.withdraw_error(
+            "INVALID_REQUEST", "Request body must be valid JSON"))
     if not isinstance(b, dict):
-        return jsonify(ok=False, accepted=False, message="Request body must be a JSON object"), 400
+        return _withdraw_response(engine.withdraw_error(
+            "INVALID_REQUEST", "Request body must be a JSON object"))
 
     client_id = b.get("clientId") or b.get("client_id")
-    verified, message, status = eng.verify_withdraw_signature(
+    verified, message, error_code = eng.verify_withdraw_signature(
         client_id, raw_body, request.headers.get("X-Signature")
     )
     if not verified:
-        eng.log(f"⚠ withdraw request rejected: {message}")
-        return jsonify(
-            ok=False,
-            accepted=False,
-            message=message,
-            requestId=b.get("requestId") or b.get("request_id") or "",
-            received_at=time.time(),
-        ), status
+        eng.log(f"⚠ withdraw request rejected: {message} [{error_code}]")
+        return _withdraw_response(engine.withdraw_error(
+            error_code, message,
+            requestId=b.get("requestId") or b.get("request_id") or ""))
 
     src = request.headers.get("X-Forwarded-For") or request.remote_addr or ""
-    res = eng.receive_withdraw_request(b, src)
-    status = int(res.pop("code", 200))
-    return jsonify(**res, received_at=time.time()), status
+    return _withdraw_response(eng.receive_withdraw_request(b, src))
 
 
 @app.get("/api/sync/status")

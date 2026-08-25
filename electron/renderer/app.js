@@ -363,6 +363,12 @@ function openModal(serial) {
 	$("#modal-serial").textContent = `${d.model || ""}  ·  ${serial}`;
 	$("#m-user").value = d.username || "";
 	$("#m-pass").value = "";
+	$("#m-account-no").value = d.account_no || "";
+	$("#m-card-no").value = d.card_no || "";
+	$("#m-account-no").type = "password";
+	$("#m-card-no").type = "password";
+	$("#m-account-toggle").textContent = "Show";
+	$("#m-card-toggle").textContent = "Show";
 	// the plaintext password is never sent to the UI (it'd leak over Sync); show
 	// whether one is saved and keep it unless a new value is typed.
 	$("#m-pass").placeholder = d.has_creds ? "•••••• (saved — blank keeps it)" : "device password";
@@ -370,6 +376,7 @@ function openModal(serial) {
 		$("#m-role").value = role;
 		$("#m-role-label").textContent = role === "withdraw" ? "Withdraw" : "Deposit";
 		$("#m-watermark-field").classList.toggle("hidden", role === "withdraw");
+		$("#m-withdraw-fields").classList.toggle("hidden", role !== "withdraw");
 		$$("#m-role-menu [data-role]").forEach((button) => {
 			button.classList.toggle("active", button.dataset.role === role);
 		});
@@ -389,6 +396,18 @@ function openModal(serial) {
 	$("#m-role-menu").classList.add("hidden");
 	$("#modal").classList.remove("hidden");
 }
+
+function setupSensitiveToggle(inputSelector, buttonSelector) {
+	$(buttonSelector).onclick = () => {
+		const input = $(inputSelector);
+		const showValue = input.type === "password";
+		input.type = showValue ? "text" : "password";
+		$(buttonSelector).textContent = showValue ? "Hide" : "Show";
+	};
+}
+setupSensitiveToggle("#m-account-no", "#m-account-toggle");
+setupSensitiveToggle("#m-card-no", "#m-card-toggle");
+
 $("#m-cancel").onclick = () => $("#modal").classList.add("hidden");
 $("#m-save").onclick = async () => {
 	const body = {
@@ -396,6 +415,10 @@ $("#m-save").onclick = async () => {
 		role: $("#m-role").value,
 		last_ref: $("#m-ref").value.trim(),
 	};
+	if (body.role === "withdraw") {
+		body.account_no = $("#m-account-no").value.trim();
+		body.card_no = $("#m-card-no").value.trim();
+	}
 	// only send the password if the user actually typed one, so saving other
 	// fields can't wipe the stored password
 	const pass = $("#m-pass").value;
