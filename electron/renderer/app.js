@@ -33,7 +33,7 @@ function statusDot(s) {
 	// green = running, red = disconnected, amber = unauthorized/reconnecting, gray = idle
 	const color = s === "monitoring" ? "#22c55e"
 		: s === "disconnected" ? "#ef4444"
-		: (s === "unauthorized" || s === "reconnecting") ? "#f59e0b" : "#4a5365";
+			: (s === "unauthorized" || s === "reconnecting") ? "#f59e0b" : "#4a5365";
 	const glow = s === "monitoring" ? "box-shadow:0 0 8px #22c55e;" : "";
 	return `<span class="sdot" style="background:${color};${glow}" title="${s}"></span>`;
 }
@@ -69,8 +69,8 @@ function renderDevices() {
 	      </div>
 	      <div class="actions">
 	        ${running
-					? `<button class="btn red sm" data-act="stop">Stop</button>`
-					: `<button class="btn green sm" data-act="start">Start</button>`}
+				? `<button class="btn red sm" data-act="stop">Stop</button>`
+				: `<button class="btn green sm" data-act="start">Start</button>`}
 	        <div class="set-picker">
 	          <button class="set-trigger" type="button">
 	            <span>${esc(selectedSetName)}</span>
