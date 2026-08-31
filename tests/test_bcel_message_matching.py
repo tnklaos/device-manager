@@ -109,6 +109,20 @@ class DetailMatchTests(unittest.TestCase):
     def test_matching_transaction_is_accepted(self):
         self.assertTrue(bcel.detail_matches_row(self.row, self.rec))
 
+    def test_qr_description_time_does_not_override_message_timestamp(self):
+        pipe = "LMPS QR TRANSFER IN|001|02012345678|BCEL|OWN|PHON|14:34:35"
+        row = f"ACC\n50,000 LAK\nAccount 0101234567\n{pipe}\n14:34:36"
+        rec = {**self.rec, "time": "31/08/2026 14:34:36", "raw": [pipe]}
+        self.assertTrue(bcel.detail_matches_row(row, rec))
+        self.assertEqual(bcel._row_record(row, (100, 200), 2400)["key"], "ACC|14:34:36|50,000 LAK")
+
+    def test_qr_description_alone_cannot_supply_missing_message_time(self):
+        row = "ACC\n50,000 LAK\nLMPS QR TRANSFER IN|001|02012345678|BCEL|OWN|PHON|10:15:22"
+        self.assertFalse(bcel.detail_matches_row(row, self.rec))
+
+    def test_conflicting_timestamp_fields_are_rejected(self):
+        self.assertFalse(bcel.detail_matches_row(self.row + "\n10:15:23", self.rec))
+
     def test_previous_sender_name_is_rejected(self):
         mixed = {**self.rec, "raw": ["ຈາກບັນຊີ", "PHOU\n02099999999"]}
         self.assertFalse(bcel.detail_matches_row(self.row, mixed))
@@ -161,6 +175,7 @@ class DetailMatchTests(unittest.TestCase):
 class MessageDetailNavigationTests(unittest.TestCase):
     def test_titleprev_restores_message_list(self):
         device = mock.Mock()
+        device.app_current.return_value = {"package": bcel.PKG}
         state = {"list": False}
         titleprev = mock.Mock()
         titleprev.exists = True
@@ -169,8 +184,11 @@ class MessageDetailNavigationTests(unittest.TestCase):
         type(titlecontext).exists = mock.PropertyMock(
             side_effect=lambda: state["list"]
         )
+        detail_marker = mock.Mock()
+        detail_marker.exists = True
         device.xpath.side_effect = lambda query: (
-            titleprev if "titleprev" in query else titlecontext
+            titleprev if "titleprev" in query else
+            titlecontext if "titlecontext" in query else detail_marker
         )
 
         with (mock.patch.object(

@@ -23,6 +23,10 @@ PKG = "com.bcel.bcelone"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+class MessagesUIError(RuntimeError):
+    """Messages cannot be navigated safely; stop rather than guessing actions."""
+
+
 # hide the per-child console window on Windows (0 on macOS/Linux)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -527,6 +531,10 @@ def _detail_fingerprint(rec):
 
 def _extract_message_detail(d):
     """Read the open message-detail screen into a dict, incl. a unique 'ref'."""
+    root = _message_snapshot(d)
+    frame = _new_message_frame(root)
+    if frame is not None:
+        return _extract_new_detail(frame)
     rec = {"type": "", "account": "", "time": "", "kind": "", "raw": []}
     pending = None
     for el in d.xpath('//*').all():
@@ -608,16 +616,192 @@ def _ddmmyyyy(text):
     return match.group(1) if match else ""
 
 
+_MESSAGE_KINDS = {"TRI", "TRO", "ACC", "SAL", "TOP", "TFO"}
+_NEW_REFRESH = '//*[@resource-id="messageframe"]//*[@content-desc="Context Icon"]'
+_NEW_TAB = '//*[@resource-id="bottomtab"]//*[@content-desc="Message"]'
+
+
+def _message_snapshot(d):
+    try:
+        return ET.fromstring(d.dump_hierarchy())
+    except (ET.ParseError, TypeError):
+        return None
+
+
+def _new_message_frame(root):
+    if root is None:
+        return None
+    frames = [n for n in root.iter("node") if n.get("resource-id") == "messageframe"]
+    if len(frames) != 1:
+        return None
+    frame = frames[0]
+    if any(n.get("resource-id") in ("titlecontext", "titletext") for n in frame.iter("node")):
+        return None                         # keep the legacy parser unchanged
+    return frame
+
+
+def _texts(node):
+    return [(n.get("text") or "").strip() for n in node.iter("node")
+            if (n.get("text") or "").strip()]
+
+
+def _new_detail_panel(frame):
+    if frame is None:
+        return None
+    parents = {child: parent for parent in frame.iter() for child in parent}
+    panels = []
+    for nav in frame.iter("node"):
+        if (nav.get("class", "").endswith("NavigationView")
+                and any(n.get("content-desc") == "Close" for n in nav.iter("node"))):
+            panel = parents.get(nav)
+            if panel is not None and any(n.get("text") in _MESSAGE_KINDS for n in panel):
+                panels.append(panel)
+    return panels[0] if len(panels) == 1 else None
+
+
+def _extract_new_detail(frame):
+    empty = {"type": "", "account": "", "time": "", "kind": "", "raw": [], "ref": ""}
+    panel = _new_detail_panel(frame)
+    if panel is None:
+        return empty
+    # Only direct fields of the OPEN panel, never the retained list behind it.
+    nav = next(n for n in panel if n.get("class", "").endswith("NavigationView"))
+    headings = _texts(nav)
+    fields = [(n.get("text") or "").strip() for n in panel if (n.get("text") or "").strip()]
+    kind = next((t for t in fields if t in _MESSAGE_KINDS), "")
+    account = next((t for t in fields if t.startswith("Account ")), "")
+    timestamp = next((t for t in fields if re.fullmatch(r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}", t)), "")
+    labels = {**_MSG_LABELS, "ຈາກບັນຊີ": "sender"}
+    values = {}
+    for i, text in enumerate(fields):
+        if text in labels:
+            key = labels[text]
+            if key in values:
+                return empty                 # ambiguous/transitioning panel
+            if i + 1 < len(fields) and fields[i + 1] not in labels:
+                values[key] = fields[i + 1]
+    bill = values.get("bill_no", "")
+    amount = values.get("amount_in") or values.get("amount") or values.get("amount_out")
+    pipes = [t for t in fields if "|" in t and
+             t.split("|", 1)[0].upper().replace(" ", "").startswith(("LMPSQRTRANSFERIN", "ONEPAY"))]
+    pipe = pipes[0] if len(pipes) == 1 else ""
+    source_account, source_name = row_source(pipe) if pipe else ("", "")
+    pipe_complete = len(pipe.split("|")) >= 6 and source_account and source_name
+    if not (len(headings) == 1 and kind and account and timestamp
+            and re.fullmatch(r"[A-Za-z0-9-]+", bill)
+            and _amount_identity(amount) and (values.get("sender") or pipe_complete)):
+        return empty                         # never generate a fallback ref for this layout
+    if pipe_complete:
+        values.setdefault("details", pipe)
+    rec = {"type": headings[0], "account": account, "time": timestamp,
+           "kind": kind, "ref": bill, **values}
+    # Adapt the new labelled panel to the gateway's existing fixed-index contract.
+    # These prefix strings are protocol metadata; all transaction values come
+    # from this one detail panel. In particular raw[9] is an account, not a bill.
+    raw = ["MAIN", "BCEL One", "OneBank", "MESSAGE",
+           "ຈາກບັນຊີ" if values.get("sender") else pipe,
+           values.get("sender") or f"{source_name}\n{source_account}",
+           "ລາຍລະອຽດ", values.get("details", ""), "ຫາບັນຊີ",
+           values.get("to_account") or account.removeprefix("Account ").strip(),
+           "ເລກໃບບິນ", bill]
+    for label, key in _MSG_LABELS.items():
+        if key in ("amount_in", "amount_out", "amount") and key in values:
+            raw.extend([label, values[key]])
+    rec["raw"] = raw
+    return rec
+
+
+def _row_record(sig, center, height):
+    km = re.search(r"\b(TRI|TRO|ACC|SAL|TOP|TFO)\b", sig)
+    kind = km.group(1) if km else ""
+    am = _AMOUNT_RE.search(sig)
+    positive = bool(am) and am.group(1).lstrip()[:1] not in ("-", "−")
+    timestamp = _row_timestamp(sig)
+    key = "|".join((kind, timestamp, am.group(0).strip() if am else ""))
+    return {"cy": center[1] / height, "center": center, "key": key, "sig": sig,
+            "kind": kind, "incoming": _row_is_incoming(kind, sig, positive)}
+
+
+def _new_list_rows(frame, info):
+    # The updated WebView retains the previous list while showing detail.
+    if any(n.get("content-desc") == "Close" for n in frame.iter("node")):
+        return []
+    parents = {child: parent for parent in frame.iter() for child in parent}
+    scrolls = [n for n in frame.iter("node") if n.get("scrollable") == "true"]
+    if len(scrolls) != 1:
+        return []
+    scroll = scrolls[0]
+    panel = parents.get(scroll)
+    if panel is None or not any(
+            n.get("class", "").endswith("NavigationView") and "ຂໍ້ຄວາມ" in _texts(n)
+            and any(c.get("content-desc") == "Context Icon" for c in n.iter("node"))
+            for n in panel):
+        return []
+    viewport = _parse_bounds(scroll.get("bounds"))
+    if not viewport:
+        return []
+    rows = []
+    for index, node in enumerate(scroll, 1):
+        texts = _texts(node)
+        if sum(t in _MESSAGE_KINDS for t in texts) != 1:
+            continue
+        bounds = _parse_bounds(node.get("bounds"))
+        if not bounds:
+            continue
+        x1, y1, x2, y2 = bounds
+        center = ((x1 + x2) // 2, (y1 + y2) // 2)
+        if not (viewport[1] <= center[1] < viewport[3]):
+            continue
+        row = _row_record("\n".join(texts), center, info.get("displayHeight", 2408))
+        # Use the actual accessible row node, not guessed coordinates or a
+        # clickable-flag override. Detail verification still guards list changes.
+        row["xpath"] = f'(//*[@resource-id="messageframe"]//*[@scrollable="true"])[1]/*[{index}]'
+        rows.append(row)
+    return rows
+
+
 def _message_list_visible(d):
     """True only for the real Messages list, not detail-shaped full-width nodes."""
-    return (d.xpath('//*[@resource-id="titlecontext"]').exists
-            and bool(_list_rows(d)))
+    if d.xpath('//*[@resource-id="titlecontext"]').exists:
+        return bool(_list_rows(d))
+    frame = _new_message_frame(_message_snapshot(d))
+    return frame is not None and bool(_new_list_rows(frame, d.info))
+
+
+def _message_detail_visible(d):
+    # A missing/empty list is NOT proof that a detail is open. Require both
+    # detail-specific markers in the foreground bank app before navigating back.
+    if d.app_current().get("package") != PKG:
+        return False
+    if (d.xpath('//*[@resource-id="titletext"]').exists
+            and d.xpath('//*[@resource-id="subtitlehead"]').exists):
+        return True
+    return _new_detail_panel(_new_message_frame(_message_snapshot(d))) is not None
+
+
+def _wait_for_message_list(d, timeout=15, poll=0.5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _message_list_visible(d):
+            return True
+        time.sleep(poll)
+    return _message_list_visible(d)
 
 
 def close_message_detail(d, timeout=5, poll=0.2):
-    """Leave a message detail and confirm that the Messages list is restored."""
+    """Close a positively identified detail once, never back out of a loading list."""
     if _message_list_visible(d):
         return True
+    if not _message_detail_visible(d):
+        return False
+    if _new_detail_panel(_new_message_frame(_message_snapshot(d))) is not None:
+        # This named control was verified on the real device. No coordinate or
+        # Back-key fallback if its accessibility action fails.
+        try:
+            d(description="Close").click(timeout=3)
+        except Exception:
+            return False
+        return _wait_for_message_list(d, timeout=timeout, poll=poll)
 
     controls = (
         lambda: d.xpath('//*[@resource-id="titleprev"]'),
@@ -630,39 +814,38 @@ def close_message_detail(d, timeout=5, poll=0.2):
                 continue
             control.click()
         except Exception:
-            continue
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if _message_list_visible(d):
-                return True
-            time.sleep(poll)
+            # The click may have reached the device before the transport failed.
+            # Don't follow it with another close/back on an unknown screen.
+            return False
+        return _wait_for_message_list(d, timeout=timeout, poll=poll)
 
+    if not _message_detail_visible(d):
+        return False
     try:
         d.press("back")
     except Exception:
         return False
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _message_list_visible(d):
-            return True
-        time.sleep(poll)
-    return _message_list_visible(d)
+    return _wait_for_message_list(d, timeout=timeout, poll=poll)
 
 
 def open_messages_tab(d):
-    # A message detail shares the .MainActivity activity and keeps the bottom tabs
-    # in the DOM. Navigate to Messages, then restore the real list if a detail is
-    # still open.
-    go_home(d)
-    if d(text="ບັດ").exists:
-        d(text="ບັດ").click()
-        time.sleep(0.8)
-    if not d(text="ຂໍ້ຄວາມ").wait(timeout=15):
-        raise RuntimeError("Messages tab not found")
-    d(text="ຂໍ້ຄວາມ").click()
-    time.sleep(1.2)
-    if not _message_list_visible(d):
-        close_message_detail(d)
+    # Navigate using the actual tab, not a sequence of Back presses that can
+    # exit a changed UI. connect() is responsible for reaching a logged-in app.
+    tab = d.xpath(_NEW_TAB)
+    if tab.exists:
+        tab.click()
+    elif not d(text="ຂໍ້ຄວາມ").wait(timeout=15):
+        raise MessagesUIError("Messages tab not found — check BCEL login and UI accessibility")
+    else:
+        d(text="ຂໍ້ຄວາມ").click()
+    if _wait_for_message_list(d):
+        return
+    if _message_detail_visible(d) and close_message_detail(d):
+        return
+    raise MessagesUIError(
+        "Messages list unavailable after waiting — it may be loading, empty, "
+        "changed, or inaccessible; no further navigation attempted"
+    )
 
 
 def _wait_list_settled(d, timeout=12, poll=0.6):
@@ -688,7 +871,9 @@ def _scroll_messages_to_top(d, max_swipes=30):
     stable_reads = 0
     for _ in range(max_swipes):
         rows = _list_rows(d)
-        top = rows[0]["key"] if rows else None
+        if not rows:
+            return False                       # never swipe an unidentified screen
+        top = rows[0]["key"]
         if top and top == previous_top:
             stable_reads += 1
             if stable_reads >= 2:
@@ -702,18 +887,26 @@ def _scroll_messages_to_top(d, max_swipes=30):
 
 
 def refresh_messages(d):
-    d.xpath('//*[@resource-id="titlecontext"]').click()   # tap the ↻ refresh icon
+    if not _message_list_visible(d):
+        raise MessagesUIError("Messages list unavailable before refresh")
+    refresh = d.xpath('//*[@resource-id="titlecontext"]')
+    if not refresh.exists:
+        refresh = d.xpath(_NEW_REFRESH)
+    refresh.click()                            # named refresh control, no coordinate fallback
     # Wait for the reload to actually land (non-empty + stable) instead of a fixed
     # sleep — on slow internet the fetch can still be in flight after 2s, leaving
     # the list empty/loading and making the poll read nothing.
-    _wait_list_settled(d)
+    if not _wait_list_settled(d):
+        raise MessagesUIError("Messages list did not load after refresh — no scrolling attempted")
     # Scroll back to the true top so every cycle starts from the NEWEST message.
     # A fixed number of swipes is unsafe after a deep history scan: the monitor
     # can otherwise revisit older rows and treat them as new because their ref is
     # different from the current watermark.
-    _scroll_messages_to_top(d)
+    if not _scroll_messages_to_top(d):
+        raise MessagesUIError("Messages list could not be safely scrolled to the top")
     # let the top settle after scrolling before the poll reads it
-    _wait_list_settled(d, timeout=4)
+    if not _wait_list_settled(d, timeout=4):
+        raise MessagesUIError("Messages list unavailable after scrolling")
 
 
 def _list_rows(d):
@@ -736,6 +929,9 @@ def _list_rows(d):
         root = ET.fromstring(d.dump_hierarchy())
     except Exception:
         return []
+    frame = _new_message_frame(root)
+    if frame is not None:
+        return _new_list_rows(frame, info)
     parsed = []   # (x1, y1, x2, y2, attrib) for every node with valid bounds
     for el in root.iter("node"):
         a = el.attrib
@@ -795,8 +991,7 @@ def _list_rows(d):
         # Unlike the full sig, this does NOT change when a row is partly clipped at
         # the scroll edge, so an already-clicked message isn't re-opened/re-counted
         # after scrolling.
-        tmatch = re.search(r"\b(\d{1,2}:\d{2}:\d{2})\b", sig)
-        timestamp = tmatch.group(1) if tmatch else _ddmmyyyy(sig)
+        timestamp = _row_timestamp(sig)
         key = "|".join((kind, timestamp,
                         am.group(0).strip() if am else ""))
         rows.append({"cy": (y1 + y2) / 2 / h, "center": center, "key": key,
@@ -821,6 +1016,19 @@ def _hhmmss(text):
     return m.group(1) if m else ""
 
 
+def _row_timestamp(sig):
+    """Read the message's timestamp field, never a time embedded in QR text."""
+    fields = [line.strip() for line in (sig or "").splitlines()]
+    times = [field for field in fields if re.fullmatch(
+        r"(?:\d{2}/\d{2}/\d{4}\s+)?\d{1,2}:\d{2}:\d{2}", field)]
+    if len(times) == 1:
+        return _hhmmss(times[0])
+    if times:
+        return ""                            # ambiguous timestamp fields
+    dates = [field for field in fields if re.fullmatch(r"\d{2}/\d{2}/\d{4}", field)]
+    return dates[0] if len(dates) == 1 else ""
+
+
 def detail_matches_row(row_sig, rec):
     """Verify the opened detail belongs to the row that was clicked, by comparing
     the amount, HH:MM:SS timestamp, and sender that appear in BOTH the list row and
@@ -831,14 +1039,15 @@ def detail_matches_row(row_sig, rec):
     ra = _amount_identity(row_sig)
     da = _amount_identity(rec.get("amount_in") or rec.get("amount") or "")
     detail_time = rec.get("time") or ""
-    rt, dt = _hhmmss(row_sig), _hhmmss(detail_time)
+    timestamp = _row_timestamp(row_sig)
+    rt, dt = _hhmmss(timestamp), _hhmmss(detail_time)
     if ra is None or da is None or ra != da:
         return False                      # absent/conflicting amount -> incomplete/wrong
     if rt:
         if not dt or rt != dt:
             return False                  # present time must agree exactly
     else:
-        rd, dd = _ddmmyyyy(row_sig), _ddmmyyyy(detail_time)
+        rd, dd = _ddmmyyyy(timestamp), _ddmmyyyy(detail_time)
         if not rd or not dd or rd != dd:
             return False                  # older rows expose only the transaction date
 
@@ -864,7 +1073,10 @@ def _read_verified_detail(d, row, log=print):
         cur = next((r for r in _list_rows(d) if r["key"] == row["key"]), None)
         if cur is None:
             return None                           # row scrolled away
-        d.click(*cur["center"])
+        if cur.get("xpath"):
+            d.xpath(cur["xpath"]).click()
+        else:
+            d.click(*cur["center"])
         rec, opened = None, False
         stable_fingerprint, stable_reads = None, 0
         deadline = time.time() + 10               # wait up to 10s for a slow load
@@ -889,6 +1101,10 @@ def _read_verified_detail(d, row, log=print):
                         break
                 else:
                     stable_fingerprint, stable_reads = None, 0
+        # Incomplete data can still be a recognized detail panel. Close that
+        # panel safely before retrying; never mistake missing fields for a list.
+        if not opened:
+            opened = _message_detail_visible(d)
         if opened and not close_message_detail(d):
             log("⚠ detail close failed — message list was not restored")
             return None
@@ -897,16 +1113,15 @@ def _read_verified_detail(d, row, log=print):
             # have refreshed since the row was first selected.
             return rec, cur["sig"]
         log(f"detail not ready/mismatch for {row['key']} (attempt {attempt + 1}/3) — retrying")
-        # If the tap never opened a detail and we left the list, get back to it.
+        # Without a recognized detail or list, Back may exit the bank app.
         if not opened and not _list_rows(d):
-            d.press("back")
-            time.sleep(0.5)
+            raise MessagesUIError("Messages list unavailable after opening a row — no Back pressed")
     log(f"⚠ could not read a complete matching detail for {row['key']} — skipped this cycle")
     return None
 
 
 def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6,
-                  kinds=None, fresh=False, log=print):
+                  kinds=None, fresh=False, log=print, pending_scans=None):
     """Incremental poll for incoming transactions (transfers-in and QR/LMPS-in).
       - Classifies each list row as incoming/outgoing (received title or positive
         amount); only *incoming* rows are opened to read their detail/reference.
@@ -923,6 +1138,32 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
     open_messages_tab(d)
     refresh_messages(d)
 
+    result = _scan_messages(d, last_ref, max_scrolls, log)
+    pending = list(pending_scans or [])
+    # Retry only one unfinished range per cycle. Seek to its failed row without
+    # reopening the verified history above it. New-message scanning has its own
+    # boundary and does not depend on delivery or this older range succeeding.
+    if pending:
+        task = pending.pop(0)
+        if not _scroll_messages_to_top(d) or not _wait_list_settled(d):
+            raise MessagesUIError("Messages list unavailable before pending-detail retry")
+        retry = _scan_messages(d, task["last_ref"], max_scrolls, log,
+                               start_row=task["start_row"])
+        refs = {r["ref"] for r in result["new"]}
+        result["new"].extend(r for r in retry["new"] if r["ref"] not in refs)
+        if retry["pending_scan"]:
+            pending.append(retry["pending_scan"])
+    # With no verified head yet, keep the old main boundary and retry normally.
+    # In particular a failed first-run baseline must never send history.
+    if result["pending_scan"] and result["scan_ref"] != last_ref:
+        pending.append(result["pending_scan"])
+    result["pending_scans"] = pending
+    return result
+
+
+def _scan_messages(d, last_ref, max_scrolls, log, start_row=None):
+    """Scan a new range, or seek directly to an unfinished range's first row."""
+
     def detail_incoming(rec):
         # money received: has an "ເງິນເຂົ້າ" (amount_in) value, or the title says received
         return bool(rec.get("amount_in")) or str(rec.get("type", "")).startswith("ໄດ້ຮັບ")
@@ -937,10 +1178,32 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
     scroll_limit = _poll_scroll_limit(last_ref, max_scrolls)
     matched = False
     blocked = False        # an incoming row could not be verified; hold old watermark
+    failed_row = None
+    last_verified_row = None
+    seeking = start_row is not None
+    reached_bottom = False
     guard = 0
     while not matched and guard < 120:
         guard += 1
         rows = _list_rows(d)
+        if not rows:
+            raise MessagesUIError("Messages list unavailable during polling — no scrolling attempted")
+        if seeking:
+            # Exact text plus key: never attach a saved retry to a different
+            # sender/day merely because its amount and HH:MM:SS happen to agree.
+            target = next((r for r in rows if r["key"] == start_row["key"]
+                           and r["sig"] == start_row["sig"]), None)
+            if target:
+                # Seeking may already have seen a clipped version of this row.
+                # Discard that seek-only history so neither it nor rows below it
+                # are accidentally considered processed when the full row appears.
+                seen = {r["key"] for r in rows[:rows.index(target)]}
+                if start_row.get("after"):
+                    seen.add(target["key"])
+                seeking = False
+                log(f"retrying unfinished scan at {target['key']} (verified rows above skipped)")
+            else:
+                seen.update(r["key"] for r in rows)
         nextrow = next((r for r in rows if r["key"] not in seen), None)
         if nextrow is None:                       # nothing new on screen
             if scrolls >= scroll_limit:
@@ -948,7 +1211,11 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
             d.swipe_ext("up", scale=0.7)
             time.sleep(1.2)
             scrolls += 1
-            if all(r["key"] in seen for r in _list_rows(d)):
+            scrolled_rows = _list_rows(d)
+            if not scrolled_rows:
+                raise MessagesUIError("Messages list unavailable after scrolling")
+            if all(r["key"] in seen for r in scrolled_rows):
+                reached_bottom = True
                 break                             # reached the bottom
             continue
         seen.add(nextrow["key"])
@@ -961,6 +1228,7 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
             # behind the watermark forever. Verified rows above it may still send;
             # global ref dedup makes their retry safe while the old watermark is held.
             blocked = True
+            failed_row = {"key": nextrow["key"], "sig": nextrow["sig"]}
             log(f"⚠ holding watermark at {last_ref or '(unset)'} — incoming row {nextrow['key']} was not verified")
             break
         rec, verified_row_sig = read_result
@@ -969,12 +1237,14 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         # reached a transaction we already sent last time -> STOP (do NOT include it)
         if last_ref is not None and rec["ref"] == last_ref:
             matched = True
+            log(f"stop reference reached = {last_ref}")
             break
         # already collected this ref in THIS poll (e.g. re-read after a scroll) ->
         # skip so it can never be sent twice
         if rec["ref"] in done_refs:
             continue
         done_refs.add(rec["ref"])
+        last_verified_row = {"key": nextrow["key"], "sig": nextrow["sig"], "after": True}
         # Source the sender from the SAME verified detail (label-anchored), so the
         # name can't come from a different/stale list-row snapshot and get attached
         # to the wrong transaction. Fall back to the list-row text only if the
@@ -1003,8 +1273,21 @@ def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6
         # still prevents advancement on transient gateway failures.
         log(f"⚠ watermark {last_ref} was not found — continuing with {len(new)} verified candidate(s)")
 
+    pending = None
+    if failed_row:
+        pending = {"last_ref": last_ref, "start_row": failed_row}
+    elif seeking:
+        pending = {"last_ref": last_ref, "start_row": start_row}
+        log("⚠ pending detail row not visible within scan limit — retained for retry")
+    elif start_row and not matched and not reached_bottom:
+        # A long unfinished range can take several cycles. Resume AFTER the last
+        # verified row instead of opening that same range from its beginning.
+        pending = {"last_ref": last_ref, "start_row": last_verified_row or start_row}
+
     return {"first_run": last_ref is None,
             "last_ref": last_ref if blocked else (new_top or last_ref),
+            "scan_ref": new_top or last_ref,
+            "pending_scan": pending,
             "new": new}
 
 

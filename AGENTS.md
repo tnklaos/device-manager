@@ -87,6 +87,28 @@ Steps:
   (stop, exclude it). `new_top` = newest verified ref → becomes the new watermark.
 - Returned `last_ref` must only ever be a **verified, complete** ref.
 
+### Independent scanning and durable retries (August 2026)
+- `devices[serial].scan_state.scan_ref` is the newest verified head from the
+  previous scan, and is the **next scan's stop point**, even if delivery fails.
+- `scan_state.outbox` stores complete verified payloads before the scan cursor
+  is persisted. Delivery retries use these payloads, not another history scan.
+- `scan_state.pending_scans` stores unfinished ranges (`last_ref`, `start_row`
+  with exact `key` + `sig`). An unreadable row ends that range, not the new-head
+  checkpoint. One pending range is retried per cycle: seek without opening the
+  completed prefix, then read only the unfinished range. Finding it may require
+  scrolling. Missing/changed row identities remain pending; do not guess matches.
+- `devices[serial].last_ref` remains the **delivery** watermark. It advances only
+  once the outbox is accepted (same existing permanent-rejection policy) and no
+  unfinished ranges remain. Never use it as the next scan boundary when a
+  `scan_ref` exists. First-run baseline still sends no historical transactions.
+- `_stage_scan` atomically persists the outbox, pending ranges, and scan cursor
+  before `_deliver_pending` can POST. Settings writes use fsync + atomic replace.
+  Manual watermark edits reset the scan cursor but preserve pending work; a
+  generation counter prevents an in-flight poll from overwriting the edit.
+- `_row_timestamp` reads the standalone message time/date field. Never take the
+  first timestamp in a whole QR row: its payment description may contain a
+  different event time (observed 14:34:35 versus message/detail 14:34:36).
+
 ### Dedup keys (two layers)
 - **`row["key"]` = `kind|HH:MM:SS|amount`** (regex-extracted) — stable even when a
   row is clipped at the scroll edge, so a row isn't re-opened after scrolling.
@@ -96,11 +118,12 @@ Steps:
 
 ## 4. Critical invariants (money-critical — break these and users lose money)
 
-1. **The watermark must only advance when the send actually succeeds.** In
-   `engine._loop`, `set_last_ref` is gated on `advance = self._send(...)`. A
-   transient gateway failure (timeout/network/5xx) returns `False` → watermark
-   held → retried next cycle. A 4xx rejection or success returns `True`. Never
-   advance on a transient failure or transactions are lost forever.
+1. **The delivery watermark must only advance when sending is accepted.**
+   `engine._deliver_pending` retains the durable outbox on `_send(...) == False`
+   (timeout/network/5xx or missing configuration). Success or a permanent 4xx
+   rejection returns `True`, following the existing rejection policy. Never
+   clear failed payloads or advance the delivery watermark on transient failure.
+   The separate scan cursor can advance only alongside durably saved retry work.
 
 2. **Global dedup of sent references.** `engine._sent_refs` (OrderedDict, bounded
    10k in memory, 3k persisted to `settings["sent_refs"]`). `_send` drops any txn

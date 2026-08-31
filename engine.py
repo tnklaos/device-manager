@@ -14,6 +14,8 @@ import threading
 import subprocess
 import collections
 import re
+import copy
+import tempfile
 from urllib.parse import urlparse
 
 import bcel
@@ -46,7 +48,7 @@ else:
     SETTINGS_FILE = os.path.join(HERE, "settings.json")
     TRANSACTIONS_FILE = os.path.join(HERE, "transactions.json")
 GATEWAY_API_URL = "https://paymentgateway.108pay.co"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 MONITOR_INTERVAL = 60
 DEFAULT_LOG_RETENTION = "7_days"
 LOG_RETENTION_DAYS = {
@@ -79,8 +81,19 @@ def load_settings():
 
 
 def save_settings(data):
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    # Scan checkpoints and unsent payloads must land together. A crash must not
+    # leave a truncated file or a new scan boundary without its pending transfers.
+    fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".tmp",
+                               dir=os.path.dirname(SETTINGS_FILE))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SETTINGS_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def load_transactions():
@@ -440,8 +453,72 @@ class Engine:
 
     def set_last_ref(self, serial, ref):
         with self._slock:
-            self.settings.setdefault("devices", {}).setdefault(serial, {})["last_ref"] = ref
+            dev = self.settings.setdefault("devices", {}).setdefault(serial, {})
+            dev["last_ref"] = ref
+            # A manual boundary change must also reset the independent scanner,
+            # but it must never discard payloads or unfinished reads awaiting retry.
+            state = dev.setdefault("scan_state", {})
+            state["scan_ref"] = ref
+            state["generation"] = state.get("generation", 0) + 1
             save_settings(self.settings)
+
+    def _scan_state(self, serial):
+        with self._slock:
+            dev = self.device_creds(serial)
+            state = copy.deepcopy(dev.get("scan_state", {}))
+            state.setdefault("scan_ref", dev.get("last_ref") or None)
+            return state
+
+    def _stage_scan(self, serial, result, generation=0):
+        """Persist verified payloads AND scan progress before any delivery call."""
+        with self._slock:
+            settings = copy.deepcopy(self.settings)
+            dev = settings.setdefault("devices", {}).setdefault(serial, {})
+            state = dev.setdefault("scan_state", {})
+            outbox = state.setdefault("outbox", [])
+            keys = {self._dedup_key({**t, "serial": serial}) for t in outbox}
+            for rec in result.get("new") or []:
+                key = self._dedup_key({**rec, "serial": serial})
+                if key not in keys:
+                    outbox.append(copy.deepcopy(rec))
+                    keys.add(key)
+            pending = copy.deepcopy(result.get("pending_scans") or [])
+            if state.get("generation", 0) == generation:
+                state["scan_ref"] = result.get("scan_ref") or result.get("last_ref") or state.get("scan_ref")
+                state["pending_scans"] = pending
+            else:
+                # A user edited the boundary during this poll. Keep their choice
+                # and all retry work; never overwrite it with the older snapshot.
+                existing = state.setdefault("pending_scans", [])
+                for task in pending:
+                    if task not in existing:
+                        existing.append(task)
+            save_settings(settings)
+            self.settings = settings
+        self.log(f"· {serial}: next scan stop = {state.get('scan_ref') or '(unset)'}; "
+                 f"{len(outbox)} delivery pending, {len(state.get('pending_scans', []))} unfinished scan(s)")
+
+    def _deliver_pending(self, serial):
+        state = self._scan_state(serial)
+        batch = state.get("outbox") or []
+        if batch and not self._send(serial, batch):
+            self.log(f"↻ {serial}: {len(batch)} transaction(s) saved for delivery retry — no history rescan needed")
+            return False
+        delivered = {self._dedup_key({**t, "serial": serial}) for t in batch}
+        with self._slock:
+            settings = copy.deepcopy(self.settings)
+            dev = settings.setdefault("devices", {}).setdefault(serial, {})
+            current = dev.setdefault("scan_state", {})
+            current["outbox"] = [t for t in current.get("outbox", [])
+                                 if self._dedup_key({**t, "serial": serial}) not in delivered]
+            # The DELIVERY watermark is still gated on delivery and full reads.
+            # Only the separate SCAN cursor may advance while retries are pending.
+            if (not current["outbox"] and not current.get("pending_scans")
+                    and current.get("scan_ref")):
+                dev["last_ref"] = current["scan_ref"]
+            save_settings(settings)
+            self.settings = settings
+        return True
 
     # ---------- devices ----------
     def devices(self):
@@ -449,6 +526,7 @@ class Engine:
         for d in list_devices():
             s = d["serial"]
             connection = self._device_connection_status(s, d["state"])
+            scan = self._scan_state(s)
             out.append({
                 **d,
                 **connection,
@@ -456,6 +534,9 @@ class Engine:
                 "status": self._status.get(s, "idle"),
                 "has_creds": bool(self.device_creds(s).get("password")),
                 "last_ref": self.device_creds(s).get("last_ref", ""),
+                "scan_ref": scan.get("scan_ref") or "",
+                "pending_delivery": len(scan.get("outbox") or []),
+                "pending_scans": len(scan.get("pending_scans") or []),
                 "username": self.device_creds(s).get("username", ""),
                 "set": self.device_creds(s).get("set", ""),
                 "cycle": self._cycles.get(s, 0),
@@ -544,6 +625,14 @@ class Engine:
         pwd, user = creds.get("password", ""), creds.get("username", "")
         offline = 0                              # consecutive non-'device' readings
         while m["active"]:
+            # Retry saved payloads independently of phone navigation/reachability.
+            # A bank UI error must not prevent already-verified data being sent.
+            retried_delivery = bool(self._scan_state(serial).get("outbox"))
+            if retried_delivery:
+                try:
+                    self._deliver_pending(serial)
+                except Exception as e:
+                    self.log(f"⚠ {serial}: saved delivery retry failed: {e}")
             st = device_state(serial)
             if st != "device":
                 # 'unauthorized' needs a human (tap Allow) — stop right away.
@@ -574,31 +663,35 @@ class Engine:
                 continue
             offline = 0                          # reachable again -> reset
             try:
-                last_ref = self.device_creds(serial).get("last_ref") or None
+                scan = self._scan_state(serial)
+                last_ref = scan.get("scan_ref") or None
                 # Global per-device cycle counter: a fresh app restart happens at
-                # count 0 (first poll, and every FRESH_RESTART_CYCLES thereafter)
+                # count 0 (first attempt, and every FRESH_RESTART_CYCLES thereafter)
                 # to drop any expired session / frozen WebView before reading.
                 count = self._cycles.get(serial, 0)
                 fresh = (count == 0)
                 if fresh:
                     self.log(f"↻ {serial}: fresh app restart (cycle {count}/{FRESH_RESTART_CYCLES})")
                 self.log(f"⟳ {serial}: refreshing messages… (cycle {count}/{FRESH_RESTART_CYCLES})")
-                res = bcel.poll_messages(serial, last_ref, pwd, user, fresh=fresh,
-                                         log=lambda msg: self.log(f"   {serial}: {msg}"))
-                new = res.get("new") or []
-                advance = True
-                if new:
-                    advance = self._send(serial, new)
-                else:
-                    self.log(f"· {serial}: no new transactions")
-                # Only move the watermark forward if the send actually succeeded
-                # (or there was nothing to send). On a transient failure we keep
-                # the old watermark so the same transactions are retried next cycle
-                # instead of being skipped and lost.
-                if res.get("last_ref") and advance:
-                    self.set_last_ref(serial, res["last_ref"])
-                # advance the global cycle, wrapping back to 0 (fresh) every N cycles
+                # Consume the attempt BEFORE polling: a failure must not leave
+                # count at zero and force-stop BCEL again on every retry. This
+                # scheduling counter is separate from the send-gated watermark.
                 self._cycles[serial] = (count + 1) % FRESH_RESTART_CYCLES
+                res = bcel.poll_messages(serial, last_ref, pwd, user, fresh=fresh,
+                                         pending_scans=scan.get("pending_scans") or [],
+                                         log=lambda msg: self.log(f"   {serial}: {msg}"))
+                self._stage_scan(serial, res, scan.get("generation", 0))
+                if not res.get("new"):
+                    self.log(f"· {serial}: no new transactions")
+                if (res.get("new") or not retried_delivery
+                        or not self._scan_state(serial).get("outbox")):
+                    self._deliver_pending(serial)
+            except bcel.MessagesUIError as e:
+                m["active"] = False
+                self._set_status(serial, "error")
+                self.log(f"⚠ {serial}: {e} — monitor stopped; watermark unchanged. "
+                         "Check Messages manually before pressing Start again.")
+                return
             except Exception as e:
                 # Don't hard-stop on a single error (a Wi-Fi drop mid-poll throws):
                 # just log and let the tolerant top-of-loop check decide whether the

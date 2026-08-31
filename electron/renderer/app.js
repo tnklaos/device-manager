@@ -367,6 +367,7 @@ function mdToHtml(md) {
 
 // ---------- credentials modal ----------
 let modalSerial = null;
+let modalInitialRef = "";
 function openModal(serial) {
 	modalSerial = serial;
 	const d = devices.find((x) => x.serial === serial) || {};
@@ -376,15 +377,19 @@ function openModal(serial) {
 	// the plaintext password is never sent to the UI (it'd leak over Sync); show
 	// whether one is saved and keep it unless a new value is typed.
 	$("#m-pass").placeholder = d.has_creds ? "•••••• (saved — blank keeps it)" : "device password";
-	$("#m-ref").value = d.last_ref || "";
+	modalInitialRef = d.scan_ref ?? d.last_ref ?? "";
+	$("#m-ref").value = modalInitialRef;
 	$("#modal").classList.remove("hidden");
 }
 $("#m-cancel").onclick = () => $("#modal").classList.add("hidden");
 $("#m-save").onclick = async () => {
 	const body = {
 		username: $("#m-user").value.trim(),
-		last_ref: $("#m-ref").value.trim(),
 	};
+	// An ordinary credentials save must not rewind a scanner that has progressed
+	// while the modal was open. Only an intentional reference edit resets it.
+	const ref = $("#m-ref").value.trim();
+	if (ref !== modalInitialRef) body.last_ref = ref;
 	// only send the password if the user actually typed one, so saving other
 	// fields can't wipe the stored password
 	const pass = $("#m-pass").value;
