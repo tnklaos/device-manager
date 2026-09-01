@@ -83,6 +83,10 @@ class IncomingClassificationTests(unittest.TestCase):
         sig = "ACC\nMastercard Virtual 5496 28xx xxxx xx93\n49.22 USD"
         self.assertFalse(bcel._row_is_incoming("ACC", sig, positive_amount=True))
 
+    def test_lfx_is_skipped_even_when_the_amount_is_positive(self):
+        sig = "LFX\nໄດ້ຮັບເງິນໂອນ\n448,675.50 LAK"
+        self.assertFalse(bcel._row_is_incoming("LFX", sig, positive_amount=True))
+
     def test_regular_positive_acc_remains_incoming(self):
         sig = "ACC\nໄດ້ຮັບເງິນ\n50,000 LAK"
         self.assertTrue(bcel._row_is_incoming("ACC", sig, positive_amount=True))
@@ -93,7 +97,7 @@ class IncomingClassificationTests(unittest.TestCase):
         self.assertEqual(row["key"], "TRI|10:15:22|1,500.00 THB")
 
     def test_updated_decimal_suffix_is_supported_for_all_currencies(self):
-        for currency, value in (("LAK", "10,000.00"), ("USD", "10.00"), ("THB", "500.00")):
+        for currency, value in (("LAK", "1.00"), ("USD", "10.00"), ("THB", "500.00")):
             with self.subTest(currency=currency):
                 text = f"TRI\n10:15:22\n{value} {currency}"
                 self.assertEqual(bcel._amount_identity(text),
@@ -265,6 +269,28 @@ class MessageDetailNavigationTests(unittest.TestCase):
 
 
 class MessageListNavigationTests(unittest.TestCase):
+    def test_scroll_to_top_survives_two_swallowed_gestures(self):
+        class Device:
+            position = 1
+            swipes = 0
+
+            def swipe_ext(self, direction, scale=None):
+                self.swipes += 1
+                if self.swipes > 2:
+                    self.position = 0
+
+        device = Device()
+
+        def rows(current):
+            return [{"key": f"row-{current.position}"}]
+
+        with (mock.patch.object(bcel, "_list_rows", side_effect=rows),
+              mock.patch.object(bcel.time, "sleep")):
+            self.assertTrue(bcel._scroll_messages_to_top(device))
+
+        self.assertEqual(device.position, 0)
+        self.assertGreaterEqual(device.swipes, 3)
+
     def test_scroll_to_top_is_not_limited_to_three_swipes(self):
         class Device:
             position = 6
@@ -387,9 +413,9 @@ class WatermarkSafetyTests(unittest.TestCase):
         self.assertEqual(result["last_ref"], "125")
         self.assertEqual(result["new"], [])
 
-    def test_first_run_gets_deeper_card_only_search_limit(self):
-        self.assertEqual(bcel._poll_scroll_limit(None, 6), 30)
-        self.assertEqual(bcel._poll_scroll_limit("existing-ref", 6), 6)
+    def test_first_run_and_later_runs_use_the_same_scroll_limit(self):
+        self.assertEqual(bcel._poll_scroll_limit(None, 3), 3)
+        self.assertEqual(bcel._poll_scroll_limit("existing-ref", 3), 3)
 
 
 if __name__ == "__main__":

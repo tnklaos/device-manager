@@ -606,21 +606,26 @@ def _parse_bounds(bounds):
     return tuple(map(int, match.groups()))
 
 
+_SKIPPED_MESSAGE_KINDS = {"LFX"}
+
+
 def _row_is_incoming(kind, sig, positive_amount):
-    """Classify incoming money while excluding card purchase/sale notices.
+    """Classify incoming money while excluding configured/non-transfer notices.
 
     SAL/Mastercard rows can show an unsigned positive amount even though their
     detail is a card debit or failed purchase ("ເງິນອອກ"). They are not bank
     transfer income and must never block the incoming-transaction watermark.
+    LFX is intentionally excluded by product policy even when displayed green.
     """
-    if kind == "SAL" or "mastercard" in (sig or "").casefold():
+    if (kind == "SAL" or kind in _SKIPPED_MESSAGE_KINDS
+            or "mastercard" in (sig or "").casefold()):
         return False
     return "ໄດ້ຮັບ" in (sig or "") or positive_amount
 
 
 def _poll_scroll_limit(last_ref, configured_limit):
-    """Use a deeper, one-time search only while establishing the baseline."""
-    return max(configured_limit, 30) if last_ref is None else configured_limit
+    """Apply the same bounded history scan to baseline and incremental polls."""
+    return configured_limit
 
 
 def _ddmmyyyy(text):
@@ -628,7 +633,13 @@ def _ddmmyyyy(text):
     return match.group(1) if match else ""
 
 
-_MESSAGE_KINDS = {"TRI", "TRO", "ACC", "SAL", "TOP", "TFO"}
+# BCEL's September message list added FCI/LFX/LMP badges. Rows with an unknown
+# badge are deliberately ignored by the modern parser, so every observed badge
+# must be registered here before its signed amount can classify it safely.
+_MESSAGE_KINDS = {"TRI", "TRO", "ACC", "SAL", "TOP", "TFO", "FCI", "LFX", "LMP"}
+_MESSAGE_KIND_RE = re.compile(
+    r"\b(" + "|".join(map(re.escape, sorted(_MESSAGE_KINDS))) + r")\b"
+)
 _NEW_REFRESH = '//*[@resource-id="messageframe"]//*[@content-desc="Context Icon"]'
 _NEW_TAB = '//*[@resource-id="bottomtab"]//*[@content-desc="Message"]'
 
@@ -724,7 +735,7 @@ def _extract_new_detail(frame):
 
 
 def _row_record(sig, center, height):
-    km = re.search(r"\b(TRI|TRO|ACC|SAL|TOP|TFO)\b", sig)
+    km = _MESSAGE_KIND_RE.search(sig)
     kind = km.group(1) if km else ""
     am = _AMOUNT_RE.search(sig)
     positive = bool(am) and am.group(1).lstrip()[:1] not in ("-", "−")
@@ -878,21 +889,24 @@ def _wait_list_settled(d, timeout=12, poll=0.6):
 
 
 def _scroll_messages_to_top(d, max_swipes=30):
-    """Swipe toward newer rows until the visible top row stops changing."""
-    previous_top = None
-    stable_reads = 0
+    """Swipe toward newer rows until the whole visible page repeatedly stays put."""
+    previous_page = None
+    stagnant_swipes = 0
     for _ in range(max_swipes):
         rows = _list_rows(d)
         if not rows:
             return False                       # never swipe an unidentified screen
-        top = rows[0]["key"]
-        if top and top == previous_top:
-            stable_reads += 1
-            if stable_reads >= 2:
+        page = tuple(row["key"] for row in rows)
+        if page and page == previous_page:
+            stagnant_swipes += 1
+            # Samsung's WebView can swallow two consecutive downward gestures.
+            # Require three unchanged full-page snapshots before declaring that
+            # the newest edge was reached; otherwise a new top row can be skipped.
+            if stagnant_swipes >= 3:
                 return True
         else:
-            stable_reads = 0
-        previous_top = top
+            stagnant_swipes = 0
+        previous_page = page
         d.swipe_ext("down", scale=0.8)
         time.sleep(0.3)
     return False
@@ -989,7 +1003,7 @@ def _list_rows(d):
         # like QR statements and could select an unrelated/previous sender field.
         sig = "\n".join(rt)
         # the row's leading badge text is the kind code (TRI/TRO/ACC/SAL/TOP)
-        km = re.search(r"\b(TRI|TRO|ACC|SAL|TOP|TFO)\b", sig)
+        km = _MESSAGE_KIND_RE.search(sig)
         kind = km.group(1) if km else ""
         # "incoming" = money received. Detect by the title ("ໄດ້ຮັບ" = received)
         # or a positive amount (outgoing amounts are red and start with '-').
@@ -1132,7 +1146,7 @@ def _read_verified_detail(d, row, log=print):
     return None
 
 
-def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=6,
+def poll_messages(serial, last_ref=None, password="", username="", max_scrolls=3,
                   kinds=None, fresh=False, log=print, pending_scans=None):
     """Incremental poll for incoming transactions (transfers-in and QR/LMPS-in).
       - Classifies each list row as incoming/outgoing (received title or positive
@@ -1184,9 +1198,9 @@ def _scan_messages(d, last_ref, max_scrolls, log, start_row=None):
     done_refs = set()      # detail refs already collected — guards double-send
     new, new_top = [], None
     scrolls = 0
-    # A newly-added account may have many SAL/Mastercard notices above its newest
-    # actual incoming transfer. Search deeper only while establishing the no-send
-    # baseline; normal incremental polls keep the caller's smaller scroll limit.
+    stagnant_swipes = 0
+    # Baseline and incremental scans use the same bounded page-advance limit.
+    # Swipes swallowed by the WebView are retried separately and do not consume it.
     scroll_limit = _poll_scroll_limit(last_ref, max_scrolls)
     matched = False
     blocked = False        # an incoming row could not be verified; hold old watermark
@@ -1222,13 +1236,28 @@ def _scan_messages(d, last_ref, max_scrolls, log, start_row=None):
                 break
             d.swipe_ext("up", scale=0.7)
             time.sleep(1.2)
-            scrolls += 1
             scrolled_rows = _list_rows(d)
             if not scrolled_rows:
-                raise MessagesUIError("Messages list unavailable after scrolling")
+                # Samsung's WebView can briefly expose an empty container while
+                # lazy-loading the next history page. Wait for it instead of
+                # treating a transition frame as a broken Messages screen.
+                if not _wait_list_settled(d, timeout=8, poll=0.5):
+                    raise MessagesUIError("Messages list unavailable after scrolling")
+                scrolled_rows = _list_rows(d)
+                if not scrolled_rows:
+                    raise MessagesUIError("Messages list unavailable after scrolling")
             if all(r["key"] in seen for r in scrolled_rows):
-                reached_bottom = True
-                break                             # reached the bottom
+                # Some devices consume one or two swipe gestures without moving
+                # the WebView. One unchanged snapshot is not proof of the bottom.
+                stagnant_swipes += 1
+                if stagnant_swipes >= 3:
+                    reached_bottom = True
+                    break                         # repeatedly unchanged -> bottom
+            else:
+                stagnant_swipes = 0
+                # Count pages that actually advanced, not gestures swallowed by
+                # the WebView, so max_scrolls means the same across devices.
+                scrolls += 1
             continue
         seen.add(nextrow["key"])
         if not nextrow["incoming"]:               # skip outgoing — don't open it

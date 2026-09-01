@@ -1,4 +1,5 @@
 import copy
+import inspect
 import json
 import os
 import tempfile
@@ -24,7 +25,8 @@ class ScanRangeTests(unittest.TestCase):
         reads = []
 
         def read(d, selected, **kwargs):
-            ref = int(selected["sig"].split()[-1])
+            token = selected["sig"].split()[-1]
+            ref = int(token) if token.isdigit() else token
             reads.append(ref)
             return None if ref in failures else (record(ref), selected["sig"])
 
@@ -48,6 +50,35 @@ class ScanRangeTests(unittest.TestCase):
         self.assertEqual(reads, [130])
         self.assertEqual(result["new"], [])
         device.swipe_ext.assert_not_called()
+
+    def test_existing_boundary_collects_aaa_aab_then_stops_at_bbb(self):
+        result, reads, device = self.scan(["AAA", "AAB", "BBB", "BBC"], "BBB")
+        self.assertEqual(reads, ["AAA", "AAB", "BBB"])
+        self.assertEqual([item["ref"] for item in result["new"]], ["AAA", "AAB"])
+        self.assertEqual(result["scan_ref"], "AAA")
+        device.swipe_ext.assert_not_called()
+
+    def test_poll_default_is_three_page_advances(self):
+        self.assertEqual(inspect.signature(bcel.poll_messages).parameters["max_scrolls"].default, 3)
+
+    def test_three_page_limit_does_not_advance_to_a_fourth_page(self):
+        pages = [
+            [{**row(200 - index), "incoming": False}]
+            for index in range(4)
+        ] + [[row(196)]]
+        position = [0]
+        device = mock.Mock()
+        device.swipe_ext.side_effect = lambda *a, **kw: position.__setitem__(
+            0, min(position[0] + 1, len(pages) - 1))
+
+        with (mock.patch.object(bcel, "_list_rows", side_effect=lambda d: pages[position[0]]),
+              mock.patch.object(bcel, "_read_verified_detail") as read,
+              mock.patch.object(bcel.time, "sleep")):
+            result = bcel._scan_messages(device, "BBB", 3, lambda _: None)
+
+        self.assertEqual(device.swipe_ext.call_count, 3)
+        read.assert_not_called()
+        self.assertEqual(result["new"], [])
 
     def test_retry_skips_verified_prefix_and_reads_unfinished_range_only(self):
         result, reads, _ = self.scan([132, 131, 130, 129, 128, 127], "127", start=row(129))
@@ -115,6 +146,53 @@ class ScanRangeTests(unittest.TestCase):
         self.assertEqual(reads, [130])
         self.assertEqual(result["new"], [])
         self.assertIsNone(result["scan_ref"])
+
+    def test_first_baseline_saves_newest_incoming_and_stops_without_history(self):
+        result, reads, device = self.scan(["AAA", "AAB", "BBB"], None)
+        self.assertEqual(reads, ["AAA"])
+        self.assertEqual(result["scan_ref"], "AAA")
+        self.assertEqual(result["last_ref"], "AAA")
+        self.assertEqual(result["new"], [])
+        device.swipe_ext.assert_not_called()
+
+    def test_one_stalled_swipe_does_not_claim_bottom_before_incoming_row(self):
+        outgoing = {**row(200), "incoming": False}
+        incoming = row(199)
+        pages = [[outgoing], [outgoing], [incoming]]
+        position = [0]
+        device = mock.Mock()
+        device.swipe_ext.side_effect = lambda *a, **kw: position.__setitem__(
+            0, min(position[0] + 1, len(pages) - 1))
+
+        with (mock.patch.object(bcel, "_list_rows", side_effect=lambda d: pages[position[0]]),
+              mock.patch.object(bcel, "_read_verified_detail",
+                                return_value=(record(199), incoming["sig"])),
+              mock.patch.object(bcel.time, "sleep")):
+            result = bcel._scan_messages(device, None, 1, lambda _: None)
+        self.assertEqual(result["scan_ref"], "199")
+        self.assertGreaterEqual(device.swipe_ext.call_count, 2)
+
+    def test_repeated_unchanged_swipes_are_required_to_confirm_bottom(self):
+        outgoing = {**row(200), "incoming": False}
+        device = mock.Mock()
+        with (mock.patch.object(bcel, "_list_rows", return_value=[outgoing]),
+              mock.patch.object(bcel.time, "sleep")):
+            result = bcel._scan_messages(device, "old", 6, lambda _: None)
+        self.assertEqual(result["new"], [])
+        self.assertEqual(device.swipe_ext.call_count, 3)
+
+    def test_temporary_empty_scroll_frame_waits_for_lazy_page(self):
+        outgoing = {**row(200), "incoming": False}
+        incoming = row(199)
+        calls = iter(([outgoing], [outgoing], [], [incoming], [incoming]))
+        device = mock.Mock()
+        with (mock.patch.object(bcel, "_list_rows", side_effect=lambda d: next(calls)),
+              mock.patch.object(bcel, "_wait_list_settled", return_value=True),
+              mock.patch.object(bcel, "_read_verified_detail",
+                                return_value=(record(199), incoming["sig"])),
+              mock.patch.object(bcel.time, "sleep")):
+            result = bcel._scan_messages(device, None, 1, lambda _: None)
+        self.assertEqual(result["scan_ref"], "199")
 
     def test_poll_combines_new_scan_and_pending_retry_without_moving_head_backwards(self):
         task = {"last_ref": "127", "start_row": row(129)}

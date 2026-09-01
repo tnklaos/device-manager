@@ -12,7 +12,7 @@ import os
 import sys
 import bcel
 
-serial = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SERIAL", "R8YY40Y3W4L")
+serial = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SERIAL", "192.168.40.62:33993")
 amount = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("AMOUNT", "200000")
 description = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("DESCRIPTION", "444")
 password = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("PASSWORD", "")
@@ -28,8 +28,7 @@ def log(msg):
     print(f"[{serial}] {msg}", flush=True)
 
 
-res = bcel.create_qr(serial, amount, description, password, username=username,
-                     submit=submit, log=log)
+res = bcel.poll_messages(serial, "", password, username, 6)
 
 
 # if submit and res["qr_string"]:

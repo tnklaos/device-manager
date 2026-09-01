@@ -71,6 +71,44 @@ def scaled_device(width, height, detail=""):
 
 
 class ModernMessagesTests(unittest.TestCase):
+    def test_september_fci_incoming_row_is_not_discarded(self):
+        xml = LIST.replace("TRI", "FCI").replace("50,000.00 LAK", "1.00 LAK", 1)
+        d = device()
+        d.dump_hierarchy.return_value = (
+            "<hierarchy>" + xml.format(detail="") + "</hierarchy>"
+        )
+        rows = bcel._list_rows(d)
+        self.assertEqual(rows[0]["key"], "FCI|10:15:22|1.00 LAK")
+        self.assertTrue(rows[0]["incoming"])
+
+    def test_september_lfx_positive_row_is_explicitly_skipped(self):
+        xml = LIST.replace("TRI", "LFX").replace(
+            "50,000.00 LAK", "448,675.50 LAK", 1
+        )
+        d = device()
+        d.dump_hierarchy.return_value = (
+            "<hierarchy>" + xml.format(detail="") + "</hierarchy>"
+        )
+        rows = bcel._list_rows(d)
+        self.assertEqual(rows[0]["key"], "LFX|10:15:22|448,675.50 LAK")
+        self.assertFalse(rows[0]["incoming"])
+
+    def test_september_lmp_negative_row_remains_outgoing(self):
+        row = bcel._row_record(
+            "LMP\n11:04:48\n-56,000,000.00 LAK", (540, 800), 2408
+        )
+        self.assertEqual(row["kind"], "LMP")
+        self.assertFalse(row["incoming"])
+
+    def test_september_incoming_detail_codes_are_complete(self):
+        for kind, amount in (("FCI", "1.00 LAK"),):
+            with self.subTest(kind=kind):
+                detail = DETAIL.replace("TRI", kind).replace("50,000.00 LAK", amount)
+                rec = bcel._extract_message_detail(device(detail))
+                self.assertEqual(rec["kind"], kind)
+                self.assertEqual(rec["amount_in"], amount)
+                self.assertEqual(rec["ref"], "20260831000125")
+
     def test_rows_and_semantic_targets_scale_across_phone_resolutions(self):
         for width, height in ((480, 800), (720, 1600), (1080, 2408),
                               (1440, 3200), (1600, 2560)):
