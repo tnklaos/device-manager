@@ -433,7 +433,12 @@ def create_qr(serial, amount, description, password="", username="", submit=True
 
 _MSG_LABELS = {"ຫາບັນຊີ": "to_account", "ລາຍລະອຽດ": "details", "ເລກໃບບິນ": "bill_no",
                "ເງິນອອກ": "amount_out", "ເງິນເຂົ້າ": "amount_in", "ຈຳນວນເງິນ": "amount"}
-_AMOUNT_TOKEN = r"([−-]?\s*[\d,]+(?:\.\d+)?)\s*([A-Z]{3})\b"
+# A complete bank amount: comma-grouped or plain digits, optional decimal, then
+# an ISO-style currency. The numeric boundaries are deliberate. Without them,
+# malformed/new UI text such as ``10.00.00 USD`` was partially accepted as
+# ``00.00 USD`` and could appear to match the wrong detail.
+_AMOUNT_NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_AMOUNT_TOKEN = rf"(?<![\d.,])([−-]?\s*{_AMOUNT_NUMBER})(?![\d.,])\s*([A-Z]{{3}})\b"
 _AMOUNT_RE = re.compile(_AMOUNT_TOKEN)
 
 
@@ -515,8 +520,15 @@ def _accounts_conflict(left, right):
     enough evidence of a conflict. When both expose at least four digits, the last
     four must agree.
     """
-    ld = re.sub(r"\D", "", left or "")
-    rd = re.sub(r"\D", "", right or "")
+    left, right = left or "", right or ""
+    # The September UI masks the same account differently in list and detail
+    # (different visible digit fragments/lengths). A masked value is incomplete
+    # evidence and must not create a false conflict. Amount, currency, timestamp,
+    # and sender name are still independently required/matched by the caller.
+    if re.search(r"[xX*•]", left) or re.search(r"[xX*•]", right):
+        return False
+    ld = re.sub(r"\D", "", left)
+    rd = re.sub(r"\D", "", right)
     return len(ld) >= 4 and len(rd) >= 4 and ld[-4:] != rd[-4:]
 
 
@@ -829,7 +841,6 @@ def close_message_detail(d, timeout=5, poll=0.2):
 
 
 def open_messages_tab(d):
-    print(d.dump_hierarchy())
     # Navigate using the actual tab, not a sequence of Back presses that can
     # exit a changed UI. connect() is responsible for reaching a logged-in app.
     tab = d.xpath(_NEW_TAB)

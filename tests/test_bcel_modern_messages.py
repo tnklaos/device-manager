@@ -1,4 +1,5 @@
 import unittest
+import re
 from unittest import mock
 
 import bcel
@@ -54,7 +55,41 @@ def device(detail=""):
     return d
 
 
+def scaled_device(width, height, detail=""):
+    xml = LIST.format(detail=detail)
+
+    def scale(match):
+        x1, y1, x2, y2 = map(int, match.groups())
+        return (f'[{round(x1 * width / 1080)},{round(y1 * height / 2408)}]'
+                f'[{round(x2 * width / 1080)},{round(y2 * height / 2408)}]')
+
+    xml = re.sub(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', scale, xml)
+    d = device(detail)
+    d.info = {"displayWidth": width, "displayHeight": height}
+    d.dump_hierarchy.return_value = '<hierarchy>' + xml + '</hierarchy>'
+    return d
+
+
 class ModernMessagesTests(unittest.TestCase):
+    def test_rows_and_semantic_targets_scale_across_phone_resolutions(self):
+        for width, height in ((480, 800), (720, 1600), (1080, 2408),
+                              (1440, 3200), (1600, 2560)):
+            with self.subTest(size=(width, height)):
+                rows = bcel._list_rows(scaled_device(width, height))
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(rows[0]["key"], "TRI|10:15:22|50,000.00 LAK")
+                self.assertEqual(rows[0]["xpath"],
+                                 '(//*[@resource-id="messageframe"]//*[@scrollable="true"])[1]/*[1]')
+                self.assertTrue(all(0 <= row["center"][0] <= width for row in rows))
+                self.assertTrue(all(0 <= row["center"][1] <= height for row in rows))
+
+    def test_detail_extraction_is_independent_of_screen_dimensions(self):
+        for width, height in ((480, 800), (720, 1600), (1440, 3200)):
+            with self.subTest(size=(width, height)):
+                rec = bcel._extract_message_detail(scaled_device(width, height, DETAIL))
+                self.assertEqual(rec["ref"], "20260831000125")
+                self.assertEqual(rec["amount_in"], "50,000.00 LAK")
+
     def test_reads_semantic_rows_without_legacy_clickable_attribute(self):
         rows = bcel._list_rows(device())
         self.assertEqual(len(rows), 2)

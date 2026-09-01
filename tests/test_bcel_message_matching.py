@@ -92,6 +92,33 @@ class IncomingClassificationTests(unittest.TestCase):
         self.assertTrue(row["incoming"])
         self.assertEqual(row["key"], "TRI|10:15:22|1,500.00 THB")
 
+    def test_updated_decimal_suffix_is_supported_for_all_currencies(self):
+        for currency, value in (("LAK", "10,000.00"), ("USD", "10.00"), ("THB", "500.00")):
+            with self.subTest(currency=currency):
+                text = f"TRI\n10:15:22\n{value} {currency}"
+                self.assertEqual(bcel._amount_identity(text),
+                                 (bcel.Decimal(value.replace(",", "")), currency))
+                self.assertEqual(bcel._row_record(text, (100, 100), 2400)["key"],
+                                 f"TRI|10:15:22|{value} {currency}")
+
+    def test_list_decimal_and_integer_detail_are_same_amount(self):
+        for currency in ("LAK", "USD", "THB"):
+            with self.subTest(currency=currency):
+                row = f"TRI\n10:15:22\n10,000.00 {currency}"
+                detail = {"time": "01/09/2026 10:15:22",
+                          "amount_in": f"10,000 {currency}", "raw": []}
+                self.assertTrue(bcel.detail_matches_row(row, detail))
+
+    def test_multiple_decimal_points_are_rejected_not_partially_matched(self):
+        for malformed in ("10.00.00 USD", "1,000.00.00 THB", "10,00.00 LAK"):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(bcel._amount_identity(malformed))
+                self.assertIsNone(bcel._AMOUNT_RE.search(malformed))
+
+    def test_currency_is_part_of_identity(self):
+        self.assertNotEqual(bcel._amount_identity("10.00 USD"),
+                            bcel._amount_identity("10.00 THB"))
+
 
 class DetailMatchTests(unittest.TestCase):
     def setUp(self):
@@ -152,6 +179,15 @@ class DetailMatchTests(unittest.TestCase):
     def test_masked_account_does_not_create_false_conflict(self):
         masked_row = self.row.replace("02012345678", "xxx-x-5678")
         self.assertTrue(bcel.detail_matches_row(masked_row, self.rec))
+
+    def test_differently_masked_same_account_does_not_false_conflict(self):
+        row = self.row.replace("02012345678", "0201-xxxx-3456-78")
+        detail = {**self.rec, "raw": ["ຈາກບັນຊີ", "PHON\n0201-xx-34"]}
+        self.assertTrue(bcel.detail_matches_row(row, detail))
+
+    def test_unmasked_account_conflict_is_still_rejected(self):
+        detail = {**self.rec, "raw": ["ຈາກບັນຊີ", "PHON\n02099999999"]}
+        self.assertFalse(bcel.detail_matches_row(self.row, detail))
 
     def test_date_only_row_matches_detail_on_same_date(self):
         date_only_row = self.row.replace("10:15:22", "01/07/2026")
