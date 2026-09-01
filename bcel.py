@@ -829,6 +829,7 @@ def close_message_detail(d, timeout=5, poll=0.2):
 
 
 def open_messages_tab(d):
+    print(d.dump_hierarchy())
     # Navigate using the actual tab, not a sequence of Back presses that can
     # exit a changed UI. connect() is responsible for reaching a logged-in app.
     tab = d.xpath(_NEW_TAB)
