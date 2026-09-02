@@ -323,8 +323,14 @@ class DurableScanTests(unittest.TestCase):
     def test_saved_delivery_retries_even_if_phone_ui_is_unavailable(self):
         self.stage()
         monitor = {"active": True}
+
+        def unavailable(*args, **kwargs):
+            monitor["active"] = False
+            raise bcel.MessagesUIError("unavailable")
+
         with (mock.patch.object(engine, "device_state", return_value="device"),
-              mock.patch.object(engine.bcel, "poll_messages", side_effect=bcel.MessagesUIError("unavailable"))):
+              mock.patch.object(engine.bcel, "poll_messages", side_effect=unavailable),
+              mock.patch.object(engine.time, "sleep")):
             self.eng._loop("test", monitor)
         self.eng._send.assert_called_once()
         self.assertEqual(len(self.eng._scan_state("test")["outbox"]), 3)

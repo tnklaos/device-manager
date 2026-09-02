@@ -139,17 +139,26 @@ class MonitorRestartSafetyTests(unittest.TestCase):
             eng._loop("test-device", state)
         return flags
 
-    def test_failed_first_poll_does_not_force_restart_next_poll(self):
+    def test_failed_poll_forces_a_clean_restart_next_poll(self):
         eng = self.make_engine()
         flags = self.run_polls(eng, [RuntimeError("failed"), RuntimeError("failed")])
-        self.assertEqual(flags, [True, False])
+        self.assertEqual(flags, [True, True])
         eng.set_last_ref.assert_not_called()
         eng._send.assert_not_called()
+
+    def test_opaque_message_poll_failure_reopens_immediately(self):
+        eng = self.make_engine(cycle=1)
+        flags = self.run_polls(
+            eng,
+            [RuntimeError("WebView failed"), {"last_ref": "existing-ref", "new": []}],
+        )
+        self.assertEqual(flags, [False, True])
+        self.assertIn("closing and reopening BCEL", str(eng.log.call_args_list))
 
     def test_restart_schedule_still_wraps_after_thirty_attempts(self):
         eng = self.make_engine(cycle=29)
         self.assertEqual(self.run_polls(eng, [RuntimeError("failed")] * 3),
-                         [False, True, False])
+                         [False, True, True])
 
     def test_transient_send_failure_still_holds_watermark(self):
         eng = self.make_engine()
@@ -165,21 +174,44 @@ class MonitorRestartSafetyTests(unittest.TestCase):
         self.run_polls(eng, [{"last_ref": "new-ref", "new": [{"ref": "new-ref"}]}])
         self.assertEqual(eng.device_creds("test-device")["last_ref"], "new-ref")
 
-    def test_inaccessible_messages_stop_monitor_without_sending_or_advancing(self):
-        eng = self.make_engine()
+    def test_messages_failure_reopens_once_without_sending_or_advancing(self):
+        eng = self.make_engine(cycle=1)
         state = {"active": True}
         error = bcel.MessagesUIError("Messages list unavailable")
+        flags = []
+
+        def poll(*args, **kwargs):
+            flags.append(kwargs["fresh"])
+            if len(flags) == 1:
+                raise error
+            state["active"] = False
+            return {"last_ref": "existing-ref", "new": []}
+
         with (mock.patch.object(engine, "device_state", return_value="device"),
-              mock.patch.object(engine.bcel, "poll_messages", side_effect=error) as poll,
-              mock.patch.object(engine.time, "sleep") as sleep):
+              mock.patch.object(engine.bcel, "poll_messages", side_effect=poll),
+              mock.patch.object(engine.time, "sleep")):
             eng._loop("test-device", state)
-        self.assertFalse(state["active"])
-        poll.assert_called_once()
-        sleep.assert_not_called()
+        self.assertEqual(flags, [False, True])
         eng._send.assert_not_called()
         eng.set_last_ref.assert_not_called()
-        eng._set_status.assert_called_once_with("test-device", "error")
-        self.assertIn("watermark unchanged", eng.log.call_args.args[0])
+        self.assertIn("closing and reopening BCEL", str(eng.log.call_args_list))
+
+    def test_reopened_messages_failure_keeps_monitor_recovering(self):
+        eng = self.make_engine()
+        state = {"active": True}
+
+        def poll(*args, **kwargs):
+            state["active"] = False
+            raise bcel.MessagesUIError("still unavailable")
+
+        with (mock.patch.object(engine, "device_state", return_value="device"),
+              mock.patch.object(engine.bcel, "poll_messages", side_effect=poll),
+              mock.patch.object(engine.time, "sleep")):
+            eng._loop("test-device", state)
+        eng._set_status.assert_any_call("test-device", "reconnecting")
+        self.assertIn("monitor remains active", str(eng.log.call_args_list))
+        eng._send.assert_not_called()
+        eng.set_last_ref.assert_not_called()
 
 
 if __name__ == "__main__":

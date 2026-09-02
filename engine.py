@@ -673,13 +673,34 @@ class Engine:
                 if fresh:
                     self.log(f"↻ {serial}: fresh app restart (cycle {count}/{FRESH_RESTART_CYCLES})")
                 self.log(f"⟳ {serial}: refreshing messages… (cycle {count}/{FRESH_RESTART_CYCLES})")
-                # Consume the attempt BEFORE polling: a failure must not leave
-                # count at zero and force-stop BCEL again on every retry. This
-                # scheduling counter is separate from the send-gated watermark.
+                # Consume the attempt before polling. Recovery explicitly resets
+                # this to zero only when another clean restart is needed; this
+                # scheduling counter remains separate from the send-gated watermark.
                 self._cycles[serial] = (count + 1) % FRESH_RESTART_CYCLES
-                res = bcel.poll_messages(serial, last_ref, pwd, user, fresh=fresh,
-                                         pending_scans=scan.get("pending_scans") or [],
-                                         log=lambda msg: self.log(f"   {serial}: {msg}"))
+                poll_args = {
+                    "pending_scans": scan.get("pending_scans") or [],
+                    "log": lambda msg: self.log(f"   {serial}: {msg}"),
+                }
+                try:
+                    res = bcel.poll_messages(
+                        serial, last_ref, pwd, user, fresh=fresh, **poll_args
+                    )
+                except Exception as first_error:
+                    if fresh:
+                        # This attempt already force-closed/reopened BCEL. Keep the
+                        # monitor alive and let the outer recovery schedule another
+                        # clean attempt instead of repeatedly restarting in one loop.
+                        raise
+                    self.log(
+                        f"↻ {serial}: Messages poll failed ({first_error}) — "
+                        "closing and reopening BCEL"
+                    )
+                    # A successful fallback restart begins a new restart interval.
+                    self._cycles[serial] = 1
+                    res = bcel.poll_messages(
+                        serial, last_ref, pwd, user, fresh=True, **poll_args
+                    )
+                self._set_status(serial, "monitoring")
                 self._stage_scan(serial, res, scan.get("generation", 0))
                 if not res.get("new"):
                     self.log(f"· {serial}: no new transactions")
@@ -687,16 +708,25 @@ class Engine:
                         or not self._scan_state(serial).get("outbox")):
                     self._deliver_pending(serial)
             except bcel.MessagesUIError as e:
-                m["active"] = False
-                self._set_status(serial, "error")
-                self.log(f"⚠ {serial}: {e} — monitor stopped; watermark unchanged. "
-                         "Check Messages manually before pressing Start again.")
-                return
+                # A Messages UI failure is recoverable. Do not make the user press
+                # Start again and never alter the scan/delivery checkpoints. The
+                # next cycle force-closes/reopens BCEL before trying the tab again.
+                self._cycles[serial] = 0
+                self._set_status(serial, "reconnecting")
+                self.log(
+                    f"⚠ {serial}: {e} — watermark unchanged; monitor remains active "
+                    "and will reopen BCEL on the next cycle"
+                )
             except Exception as e:
                 # Don't hard-stop on a single error (a Wi-Fi drop mid-poll throws):
-                # just log and let the tolerant top-of-loop check decide whether the
-                # device is really gone over the next few cycles.
-                self.log(f"✗ {serial}: {e}")
+                # schedule a clean app restart as well; an opaque u2/WebView error
+                # is often another form of a stale Messages surface.
+                self._cycles[serial] = 0
+                self._set_status(serial, "reconnecting")
+                self.log(
+                    f"✗ {serial}: {e} — watermark unchanged; monitor remains active "
+                    "and will reopen BCEL on the next cycle"
+                )
             for _ in range(MONITOR_INTERVAL):
                 if not m["active"]:
                     break
